@@ -1,0 +1,1 @@
+people focus on IK, and overlook other optimization that might go into control for robotic arm.
