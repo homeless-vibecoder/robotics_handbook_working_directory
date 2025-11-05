@@ -115,15 +115,36 @@ Introduce the problem (short)
 
 Decomposition into independent parts (unfortunately, the text format doesn't allow for proper arrangement):
 
+1) Decompose motions:
+    - motor angular velocity to wheel linear velocity
+    - wheel velocity to linear, angular velocities $v, w$
+    - MAYBE? direction + linear speed to along vs perpendicular to the line
 
-Decompose motions: motors to translation + rotation (and general lesson/principle), motion along + perpendicular to the line (so, introduce/decompose as theta, speed and mention how theta is x', where x is distance of the robot from the line)
+2) Discuss different time-scales and what our OP is:
+    - electric components (almost instant control over current/acceleration of motor)
+    - setting motor to a certain velocity (hence, controlling $v, w$)
+    - how fast we can turn (so, control $\theta$ using $w$)
+    - don't forget to then sum up, and say that different time-scales can be considered separately/independently - delay from electric components can be ignored on the scale of $w\to \theta$
+General principle: we don't even care about whether we control $x', x'''$ or whatnot. Only thing that matters is amount of delay - otherwise, we can think of (approximate) control of (PV) $x$ by $x'$, which is bounded (the approximation breaks at small $x$ - quadratic vs linear becomes more relevant).
 
-Discuss what control we have over the robot and contrast with motor speed control: here we want to control x, and instead we can control power/acceleration to/of the motors. Velocity of motors control theta', so acceleration controls theta''. theta itself controls x'. So, we have control over x'''.
-    - introduce/understand the hierarchy of control, and how one determines it
+Note: we have "direct control" over output (OP) - ie the manipulated/control variable, and we try to indirectly influence the process variable (PV).
 
-Do control of x by x''' - this discussion should be (structurally) similar to that of motor speed control: analyse different control algorithms, find analogies with motor speed control (analogies in strategies). Note that it is important to discuss strategies in robot language: even though we have the ability to get rid of the robot and talk about x, x''' abstractly, we shouldn't do that - it should be a mix, always reinforcing.
-    - talk about state, unknown information (when doing analogies), include approximation from state - MAYBE don't worry about filtering or maybe it could be a good opportunity to talk about it
-    - say, "what if we could ... (e.g. instantly turn/set theta)"? Then, analogies with motor speed control are easy.
+2) Possibly: discuss/demonstrate different latencies as well as different orders of control (at extrema, momentum, etc.) NOTE: motor speed control should also have a similar discussion
+
+3) Talk about the fact that we have incomplete information (+ discuss strategies), hence introduce estimating certain values and state (mention that there is no set way of doing it):
+    - high-level view of the decomposition/splitting of the parts (what needs to be taken care of together/separately)
+    - assume constant speed (note: this is necessary for now - so that the strategy "just set motor velocities to zero and stay on the line" doesn't exist. later, we will/might discuss cost function and remove the assumption). Discuss how to estimate $x$ - distance to line, given the line sensor information (so, store the last time you saw the line, and get $tv\sin(\theta)$). Assume instant control over $\theta$.
+        - elaborate on implementation issues + fact-check the assumptions:
+            - assume slight delay in setting $\theta$, and add small error to $\theta$
+            - handle the case of two consecutive time/line measurements ()
+            - measurement as a random variable - it is a good practice to ignore the reading if you don't know what implications it has on your state
+            - NEEDS MORE WORK
+    - 
+
+Note: here, emphasize the split into independent parts - each part has its own "state" with its own low-level corrections, and at each level we don't worry about other control/state of other levels - we assume that we have some X degree of control
+
+
+
 
 MAYBE: compare different strategies - introduce cost function.
 
