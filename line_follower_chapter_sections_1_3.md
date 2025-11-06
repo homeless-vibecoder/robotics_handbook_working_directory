@@ -1,0 +1,30 @@
+# Line Follower Robot — Sections 1–3 (Prose Version)
+
+## 1) Decomposition into independent parts (mindset)
+
+Line following becomes much easier once we stop trying to reason about everything at once and instead separate the problem into parts with simple, stable interfaces. Our manipulated variables (what we directly set) are the motor commands on the left and right sides; our process variables (what we care about) are the robot’s position and orientation relative to the line—especially lateral offset and heading. Between these ends sit layers that transform one into the other: motor drive produces wheel speed, which produces linear and angular motion of the chassis, which in turn changes the robot’s state relative to the line, which our sensors detect.
+
+Thinking this way lets us improve each layer locally while keeping the rest of the system intact. Each layer promises a narrow, predictable behavior to the next—“if you ask me for this wheel speed, I will get close to it quickly,” or “if you give me these left/right speeds, I will turn with approximately this angular rate.” Good interfaces are the hinge that makes the whole design modular. In practice, we will also choose how fast each layer runs; faster layers handle fast phenomena (electrical and wheel dynamics), while slower layers handle slower phenomena (heading and line-relative motion). This alignment between “what the layer does” and “how fast it updates” is the backbone of a robust controller.
+
+## 2) Decomposing motion (ω_motor → v_wheel → v, w)
+
+To steer intelligently, we need a clear mental map from what we command to how the robot moves. We will keep the math light and the units explicit, and we will include a diagram placeholder to make geometry obvious.
+
+When a wheel of radius r [meters] spins at angular speed ω [radians/second], the linear speed at the rim is v_wheel = r·ω [meters/second]. This is the basic conversion from motor-side quantities to ground-side motion. Friction, slip, and compliance will bend reality a little, but at the speeds we target and on a decent surface, the relation is a reliable first approximation.
+
+A differential-drive robot uses two driven wheels separated by a track width b [meters]. Let the left and right wheel linear speeds be v_L and v_R. The robot’s forward (tangential) speed is the average, v = (v_R + v_L)/2, and its yaw rate is proportional to the difference, w = (v_R − v_L)/b. If you prefer to think in motor angular speeds, substitute v_L = r·ω_L and v_R = r·ω_R to get v = (r/2)(ω_R + ω_L) and w = (r/b)(ω_R − ω_L). These equations do not require a long derivation to be useful: they simply state that “same direction, same amount” produces straight motion, while “opposite difference” produces turning, with the geometry factor b converting that difference into an angular rate.
+
+It is also useful to connect heading and lateral motion to the line over short time windows. If the robot’s heading error relative to the line is θ [radians], then for small angles and short durations the lateral velocity is approximately ẋ ≈ v·sin(θ) ≈ v·θ. This small-angle view is a convenience, not a law; it is valid when θ is not large and we do not integrate it for too long. We will use it as a local intuition to reason about how heading corrections bend the path back toward the line.
+
+[DIAGRAM PLACEHOLDER — geometry: wheelbase b, wheel radius r, left/right wheels, sensor positions, heading θ, lateral error x]
+
+## 3) Different time-scales and what our OP is (time-scale separation)
+
+The most important organizing principle in this chapter is time-scale separation: design and tune each layer at a rate appropriate to its dynamics, and while reasoning at a slower layer, treat the faster layers as if they respond quickly enough that their delay is negligible. This is a modeling choice, not magic. It works when the faster layer actually settles well within one update of the slower layer, and it fails when we ask the inner layer to change faster than physics or actuators allow.
+
+Let us name our variables clearly. The manipulated variables (OP) are the commands we send to the motors—practically, targets for left and right wheel speeds, or equivalently a pair (v, w) that we convert to those wheel targets. The process variables (PV) are the robot’s state relative to the line—especially heading θ and lateral offset x. We also need two ideas about dynamics in plain language. First, “order of control” here just means how many steps of cause-and-effect lie between what we command and what we want to change: motor commands influence wheel speeds directly, wheel speeds influence heading next, and heading influences lateral position after that. Second, “delay” is the time it takes for a change in one layer to show up in the next; practical delays come from motor inertia, friction, voltage limits, controller sampling, and sensor update times.
+
+With that in mind, it is helpful to think in terms of characteristic times. Electrical current and torque respond very quickly (call this T_current). Wheel speeds settle a bit slower, limited by inertia and traction (T_speed). The robot’s heading responds on top of that, set by how large a turning rate we can create (T_heading). Finally, the line-relative state we measure evolves at the pace we choose to drive and sample (T_line). We do not need precise numbers; we only need them to be well separated in practice—T_current ≪ T_speed ≪ T_heading ≪ T_line—so that, for example, when we design the heading controller, we can behave as if wheel speed targets turn into actual speeds “quickly enough.”
+
+Two guardrails keep the story honest. First, we never command changes faster than an inner layer can track; we enforce rate limits and caps so that the outer loop does not overdrive the inner loop. Second, we keep our reasoning local in time and angle: small-angle intuition is powerful in short bursts but misleading if we rely on it over long arcs or at high speeds. If we respect these guardrails, time-scale separation simplifies our design without hiding the physics we need to get right.
+
