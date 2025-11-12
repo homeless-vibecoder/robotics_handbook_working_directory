@@ -46,6 +46,21 @@ Notes on making the problem more difficult: different variants (high speed, whee
 
 ____________________________________________________________________________________________________________________________________________________________
 
+
+____
+Extra notes:
+
+Independent split
+
+
+Classification of time-scales and order of control + time-scale separation as an indepdendent split
+
+To setup line follower robot, analyze what are time-scales, roughly, and say which model is most relevant
+
+____
+
+
+
 # Line follower robot:
 
 ## Introduction:
