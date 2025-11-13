@@ -18,6 +18,8 @@ It has 2 motors/wheels, 2 sensors, one on each side (close to motor) - and it ou
 In general, this isn't the only possibility and there are different variations.
 We control power to each motor (so, we control acceleration in motor - we cannot instantly set the speed to whatever we want).
 
+![Top-down view of the line follower robot with sensors and track.](pictures/line_follower_images/line_follower_setup.png)
+
 
 ## Decomposition into independent parts:
 
@@ -74,6 +76,8 @@ while the robot is running:
 
 NEED GRAPHS - show experiment(s) of how this performs. Note: we need to model configurable parts - so, if we use IR for seeing line, in the model/simulation, we use that for the robot, including delays, etc.
 
+![Bang-bang tracking response showing lateral error, heading, wheel speeds, and sensor states.](pictures/line_follower_images/bang_bang_tracking.png)
+
 ## Analysis and problems of attempt 1:
 
 There are a few good things about the attempt. First of all, it works (not well, but it does).
@@ -89,6 +93,8 @@ We shouldn't take $v=1$ - if we do that, $w=0.5$ would require $(v_l,v_r)=(0.5,1
 
 There are a few (basically equivallent) ways of solving this issue.
 Take $v$ to be whatever (e.g. $v=1$), and for rotation do $v_l-=w, v_r+=w$, after which we subtract whatever is 
+
+![Commanded vs clipped wheel speeds when base velocity saturates.](pictures/line_follower_images/wheel_speed_clipping.png)
 
 ### pseudocode
 
@@ -153,6 +159,8 @@ Of course, the classification isn't absolute, and we only talk about these as us
 Separating different time-scales is a sensible thing to do because it is indeed true that different time-scales can be thought of as independent/not affecting each other too much.
 The definition of a "different time-scale" isn't super precise, but basically it captures the idea that macroscopic processes that take multiple seconds don't really care about deviations of a few milliseconds (whether it's $5$ seconds or $5.001$ seconds, doesn't make much of a difference).
 
+![Step responses comparing fast motor current and slower chassis velocity.](pictures/line_follower_images/timescale_step_response.png)
+
 Let us think of an example of $v_l, v_r$ is line follower robot (just focus on velocity $v$ - suppose it can take on a value between $-1$ and $1$).
 Suppose we "control $v$ with a delay of $0.5$ seconds".
 This is an imprecise statement and the meaning is that to change $v$ reasonably (e.g. from $-0.3$ to $0.6$ or $1.0$ to $-1.0$) takes on average (very roughly) $0.5$ seconds.
@@ -189,6 +197,8 @@ If we didn't have momentum (and we had first-order control), the oscillation wou
 
 This seems like an obvious fact, but in practice, unless one observes, it is hard to notice, whether we have first, second or third order control.
 In practice, they all have a similar (good enough) solution - slow down when $x$ is close to $x_g$ (ie slap PID on it) - but it is good to understand the difference between these situations (and perhaps useful).
+
+![First-order vs underdamped second-order step responses illustrating overshoot.](pictures/line_follower_images/order_of_control_effect.png)
 
 
 The difference is, with higher-order control, we have "momentum terms".
@@ -243,16 +253,16 @@ This can be done by $w-=(c_yy+c_\theta\theta+c_ww)$ for $c_y, c_\theta, c_w$ cor
 
 ### pseudocode
 
-while robot is running:
-    read y, theta, v, w
-    turn_from_position = -position_gain * y
-    turn_from_angle = -angle_gain * theta
-    turn_from_spin = -spin_gain * w
-    turn_command = turn_from_position + turn_from_angle + turn_from_spin
-    forward_speed = limit(base_speed - slow_gain_y * abs(y) - slow_gain_theta * abs(theta), 0, base_speed)
-    left_speed = limit(forward_speed - (wheel_distance / 2) * turn_command, -max_speed, max_speed)
-    right_speed = limit(forward_speed + (wheel_distance / 2) * turn_command, -max_speed, max_speed)
-    send_to_motors(left_speed, right_speed)
+    while robot is running:
+        read y, theta, v, w
+        turn_from_position = -position_gain * y
+        turn_from_angle = -angle_gain * theta
+        turn_from_spin = -spin_gain * w
+        turn_command = turn_from_position + turn_from_angle + turn_from_spin
+        forward_speed = limit(base_speed - slow_gain_y * abs(y) - slow_gain_theta * abs(theta), 0, base_speed)
+        left_speed = limit(forward_speed - (wheel_distance / 2) * turn_command, -max_speed, max_speed)
+        right_speed = limit(forward_speed + (wheel_distance / 2) * turn_command, -max_speed, max_speed)
+        send_to_motors(left_speed, right_speed)
 
 ## Estimating the variables
 
@@ -272,7 +282,7 @@ Let $(y, \theta)$ denote lateral displacement and heading error relative to the 
 
    $\theta \leftarrow \theta + w \Delta t,\qquad
    y \leftarrow y + v \sin(\theta)\,\Delta t$.
-   
+
    For small $\theta$ we often linearize $\sin(\theta)\approx\theta$, which keeps the math simple and still captures the key coupling between heading and lateral error.
 
 2. **Correct using the line sensors.** Each sensor sits at a known lateral offset $\pm d/2$ from the robot center. A sensor reporting "line detected" is a noisy measurement that the line passes under that offset. We convert the binary readings into a crude lateral measurement:
