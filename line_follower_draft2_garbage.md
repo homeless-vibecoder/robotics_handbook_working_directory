@@ -14,7 +14,8 @@ To setup line follower robot, analyze what are time-scales, roughly, and say whi
 ## Introduction:
 
 Suppose we have a line follower robot. It is supposed to follow a black line on a white floor. The goal is to stay on the line - otherwise the robot gets lost (ofc, refine the setup). ATTACH A GRAPH/IMAGE
-It has 2 motors/wheels, 2 sensors, one on each side - and it outputs either 0 (if it doesn't see the line) or 1 (it sees the line).
+It has 2 motors/wheels, 2 sensors, one on each side (close to motor) - and it outputs either 0 (if it doesn't see the line) or 1 (it sees the line).
+In general, this isn't the only possibility and there are different variations.
 We control power to each motor (so, we control acceleration in motor - we cannot instantly set the speed to whatever we want).
 
 
@@ -90,16 +91,17 @@ There are a few (basically equivallent) ways of solving this issue.
 Take $v$ to be whatever (e.g. $v=1$), and for rotation do $v_l-=w, v_r+=w$, after which we subtract whatever is 
 
 ### pseudocode
-while the robot is running:
-    v=1.0 # just arbitrary - for max speed
-    v_l, v_r = v # our desired linear velocity - pure straight motion (m/s)
-    ...
-    v_l -= w # set the velocities to add the pure rotation
-    v_r += w
-    # Now to bring both to the desired range
 
-    offset_needed = max(v_l,v_r)-1, min(v_l,v_r)+1
-    out_of_range_by = 
+    while the robot is running:
+        v=1.0 # just arbitrary - for max speed
+        v_l, v_r = v # our desired linear velocity - pure straight motion (m/s)
+        ...
+        v_l -= w # set the velocities to add the pure rotation
+        v_r += w
+        # Now to bring both to the desired range
+
+        offset_needed = max(v_l,v_r)-1, min(v_l,v_r)+1
+        out_of_range_by = 
 
 
 ## Question about accuracy of assumptions
@@ -162,7 +164,7 @@ The delay, really, is due to max $v'$ being small.
 
 Imagine a car accelerating to achieve some velocity $v$.
 If we could set $v'$ to whatever we wanted (e.g. $\infty$), we would instateneouosly achieve any desired $v$.
-However, because $v'$ cannot exceed a certain value (e.g. $-2 \leq v'\leq 2$), it would take at least $\frac{\del v}{\max(v')}$ seconds to change $v$ by $\del v$.
+However, because $v'$ cannot exceed a certain value (e.g. $-2 \leq v'\leq 2$), it would take at least $\frac{\Delta v}{\max(v')}$ seconds to change $v$ by $\Delta v$.
 If we press the gas pedal all the way, we have some limit/bound on how fast we can accelerate ($v'$) - that's the limiting factor and the main reason why it takes longer for a car to go to a certain speed ($v$).
 Notice, maximum $v'$ decreases when we increase the mass - even though the power doesn't decrease, the task of accelerating becomes more difficult.
 This is why a truck cannot accelerate as quickly as a small car - it's heavy and the power compared to the mass ends up being small.
@@ -209,6 +211,11 @@ We have second order control over the angle.
 
 ### Need for memory/state - due to discrete signals, as opposed to always knowing x
 
+In order to improve the above solution (Attempt 1), we need some memory.
+Otherwise, we cannot really do more than what we have - only turn if line is seen by one of the sensors, otherwise continue going straight.
+
+To address this, we need to have a running state - collection of information (few variables) that help us make better decisions.
+For example, if we somehow estimated/memorized the distance between the line and the robot, it would be helpful since we could make more precise corrections.
 
 
 ## Attempt 2 of solving
@@ -227,10 +234,74 @@ There are a lot of ways one can estimate the variables (and some can be very ela
 
 For now, there is no need to think about both estimation and control - just assume we have the estimates.
 
+One possible solution is to fix $v$, and try to make $y, \theta, w$ all zero.
+This is a relatively arbitrary choice, but it is easy to implement.
+Note that $w=\theta'\approx y''$.
+So, we can set our output ($w$) proportional to the error.
+
+This can be done by $w-=(c_yy+c_\theta\theta+c_ww)$ for $c_y, c_\theta, c_w$ correctly tuned.
+
+### pseudocode
+
+while robot is running:
+    read y, theta, v, w
+    turn_from_position = -position_gain * y
+    turn_from_angle = -angle_gain * theta
+    turn_from_spin = -spin_gain * w
+    turn_command = turn_from_position + turn_from_angle + turn_from_spin
+    forward_speed = limit(base_speed - slow_gain_y * abs(y) - slow_gain_theta * abs(theta), 0, base_speed)
+    left_speed = limit(forward_speed - (wheel_distance / 2) * turn_command, -max_speed, max_speed)
+    right_speed = limit(forward_speed + (wheel_distance / 2) * turn_command, -max_speed, max_speed)
+    send_to_motors(left_speed, right_speed)
+
+## Estimating the variables
+
+Now, question is, how do we estimate the variables $y, \theta, v, w$?
+There are many ways to do it, and one could possibly measure them with sensors (whether directly or indirectly - e.g. wheel velocities can be measured by encoders, as opposed to speculating using only variables in code; maybe we also use accelerometer, gyro, etc.).
+We are going to use motor velocities (assume they are measured/estimated) and the line sensors to estimate the state (or the variables).
+
+The encoders give us a clean starting point. With wheel separation $L$ and wheel speeds $v_l, v_r$, the standard differential-drive kinematics tell us
+
+$v = \frac{v_r + v_l}{2}, \qquad w = \frac{v_r - v_l}{L}$
+
+Because we can read $v_l, v_r$ every control step, these two equations immediately produce reasonable estimates of $v$ and $w$ without any additional math. The real work is recovering $y$ and $\theta$ from the same measurements.
+
+Let $(y, \theta)$ denote lateral displacement and heading error relative to the tangent of the line at the closest point, and let $\Delta t$ be the control period. Every update cycle we perform:
+
+1. **Predict (dead-reckon) using encoders.**  
+
+   $\theta \leftarrow \theta + w \Delta t,\qquad
+   y \leftarrow y + v \sin(\theta)\,\Delta t$.
+   
+   For small $\theta$ we often linearize $\sin(\theta)\approx\theta$, which keeps the math simple and still captures the key coupling between heading and lateral error.
+
+2. **Correct using the line sensors.** Each sensor sits at a known lateral offset $\pm d/2$ from the robot center. A sensor reporting "line detected" is a noisy measurement that the line passes under that offset. We convert the binary readings into a crude lateral measurement:
+   ```
+   if sensors == (1, 0):  # left sensor over line, right off
+       measured_y = +d/2
+   elif sensors == (0, 1):
+       measured_y = -d/2
+   elif sensors == (1, 1):
+       measured_y = 0      # both see the line; robot roughly centered
+   else:
+       measured_y = None   # no direct observation this step
+   ```
+   When we do receive a measurement, we blend it with the dead-reckoned value. The simplest option is an exponential moving average:
+   \[
+   y \leftarrow (1-\alpha) y + \alpha\, measured\_y,
+   \]
+   with $\alpha$ between $0$ and $1$ (larger $\alpha$ trusts the sensors more). The same idea applies to $\theta$ if we add a third sensor further forward; for two rear sensors we usually keep $\theta$ from the encoder prediction alone.
+
+The overall estimator becomes a tiny predict–correct loop: dead-reckon from the wheel speeds, then gently snap the estimate toward whatever the line sensors tell us. It is already a stripped-down Kalman filter—if we ever need more robustness we can formalize it by introducing covariance matrices, but the structure stays the same.
+
+Two final practical details:
+- Wrap $\theta$ into $[-\pi, \pi]$ after each update so accumulated yaw error never explodes numerically.
+- Even though encoders measure wheel motion, we should still clamp $v_l, v_r$ to their physically plausible ranges before feeding them into the estimator; otherwise a single glitch from the motor driver can ruin the pose estimate.
+
+With this estimator providing $(y, \theta, v, w)$ every control cycle, the controller from the previous section can meaningfully adjust both steering and speed. We can now treat state estimation and control as separate modules and iterate on each independently.
 
 
-
-
+plan: I want to estimate 
 
 
 
