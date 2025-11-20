@@ -327,3 +327,25 @@ Then, derive estimators independently - VERY large topic - measurement from enco
 State estimation
 
 Queue of possible explanations (combinatorial decision)
+
+
+## Queue of explanations
+
+When we have a state where we estimate values, we are trying to reason, given our observations, what happens in the real world.
+Of course, we might be wrong, and the question is, what do we do if we find contradictory observations?
+
+For this, we need to have some backup/alterntive explanation(s) to fall back on (we don't need it per se, but it is good to have).
+
+Suppose we think (due to estimations of velocities, etc.) that the line is in the middle of the robot.
+Also suppose that we have a sensor measurement that, claiming the sensor sees the line.
+Now, either the sensor reading is noisy or our estimations are incorrect.
+Question is, what do we do in such a scenario?
+
+A reasonable solution would be to have a threshold - assume the reading is due to noise, and only take it into account once we have a few readings in a row.
+This would work well enough, but we will try and alternative method.
+
+Instead of having a fixed threshold, we start acting immideately - assume the sensor reading is correct and start acting.
+While doing this, remember the assumption - store an alternative explanation of the measurements (one which assumes the reading is due to noise and incorrect).
+If we see a different reading in the iteration, that we can fall back on the alternative explanation.
+Otherwise, we go with the current explanation.
+
