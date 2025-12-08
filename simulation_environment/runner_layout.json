@@ -1,0 +1,54 @@
+{
+  "panels": {
+    "code": {
+      "rect": [
+        735,
+        70,
+        535,
+        670
+      ],
+      "dock": "right",
+      "visible": false
+    },
+    "devices": {
+      "rect": [
+        950,
+        338,
+        320,
+        218
+      ],
+      "dock": "right",
+      "visible": false
+    },
+    "state": {
+      "rect": [
+        20,
+        340,
+        549,
+        670
+      ],
+      "dock": "bottom",
+      "visible": false
+    },
+    "logs": {
+      "rect": [
+        20,
+        70,
+        476,
+        260
+      ],
+      "dock": "left",
+      "visible": false
+    },
+    "console": {
+      "rect": [
+        386,
+        351,
+        496,
+        318
+      ],
+      "dock": "floating",
+      "visible": false
+    }
+  }
+}

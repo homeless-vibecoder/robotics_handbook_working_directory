@@ -1,0 +1,11 @@
+{
+  "name": "generic_flat",
+  "seed": 123,
+  "gravity": [
+    0.0,
+    0.0
+  ],
+  "timestep": 0.008333333333333333,
+  "terrain": [],
+  "metadata": {}
+}
