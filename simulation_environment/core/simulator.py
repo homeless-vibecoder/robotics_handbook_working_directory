@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import importlib
 import math
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 import random
 import traceback
 
@@ -20,19 +21,22 @@ from low_level_mechanics.materials import MaterialProperties
 from low_level_mechanics.world import Pose2D
 
 from middle_level_library.motors import WheelMotor, WheelMotorDetailed
-from middle_level_library.sensors import DistanceSensor, LineSensor, IMUSensor, EncoderSensor
+from middle_level_library.sensors import DistanceSensor, LineSensor, LineSensorArray, IMUSensor, EncoderSensor
 from middle_level_library.base import Sensor
 
 from .config import (
     ActuatorConfig,
     BodyConfig,
     JointConfig,
+    MaterialConfig,
     RobotConfig,
     SensorConfig,
     SnapshotState,
     WorldConfig,
     Point,
     PoseTuple,
+    StrokeConfig,
+    EnvironmentBounds,
 )
 
 
@@ -44,11 +48,14 @@ def _material_from_config(cfg) -> MaterialProperties:
     field_signals: Dict[str, float] = {}
     if getattr(cfg, "custom", None) and "line_intensity" in cfg.custom:
         field_signals["line_intensity"] = float(cfg.custom["line_intensity"])
+    traction_value = getattr(cfg, "traction", None)
+    if traction_value is None:
+        traction_value = cfg.friction
     return MaterialProperties(
         friction=cfg.friction,
         restitution=cfg.restitution,
         reflectivity=cfg.reflect_line,
-        traction=cfg.friction,
+        traction=traction_value,
         field_signals=field_signals,
         custom={
             "reflect_distance": cfg.reflect_distance,
@@ -101,6 +108,10 @@ class Simulator:
         self.max_penetration_correction: float = 0.05
         self.max_step_translation: float = 0.5
         self.debug_checks: bool = False
+        # Optional per-step trace logging
+        self.trace_enabled: bool = False
+        self.trace_log: List[Dict[str, object]] = []
+        self.trace_callback: Optional[Callable[[Dict[str, object]], None]] = None
 
     # --- Loading ---------------------------------------------------------
     def load(
@@ -135,6 +146,7 @@ class Simulator:
                 sim_obj = self._make_body(obj.body)
                 sim_obj.can_move = False
                 self.bodies[obj.name] = sim_obj
+        self._inject_environment(world_cfg)
         # Robot bodies
         for body_cfg in robot_cfg.bodies:
             sim_obj = self._make_body(body_cfg, spawn_pose=robot_cfg.spawn_pose)
@@ -191,17 +203,23 @@ class Simulator:
                 mount_pose=mount,
             )
         else:
+            material_mu = getattr(parent.material, "traction", None)
+            mu_fallback = getattr(parent.material, "friction", 0.9)
+            mu_long = float(params.get("mu_long", material_mu if material_mu is not None else mu_fallback))
+            mu_lat = float(params.get("mu_lat", mu_fallback))
             motor = WheelMotor(
                 cfg.name,
                 mount_pose=mount,
                 max_force=float(params.get("max_force", 2.0)),
-                mu_long=float(params.get("mu_long", 0.9)),
-                mu_lat=float(params.get("mu_lat", 0.8)),
+                mu_long=mu_long,
+                mu_lat=mu_lat,
                 g_equiv=float(params.get("g_equiv", 9.81)),
                 normal_force=float(params["normal_force"]) if "normal_force" in params else None,
                 lateral_damping=float(params.get("lateral_damping", 0.25)),
                 wheel_count=int(wheel_count),
                 wheel_radius=float(params.get("wheel_radius", 0.03)),
+                response_time=float(params.get("response_time", 0.05)),
+                max_wheel_omega=float(params.get("max_wheel_omega", 40.0)),
             )
         motor.attach(parent)
         self.motors[cfg.name] = motor
@@ -216,6 +234,8 @@ class Simulator:
             sensor = DistanceSensor(cfg.name, mount_pose=mount, preset=cfg.params.get("preset", "range_short"))
         elif cfg.type == "line":
             sensor = LineSensor(cfg.name, mount_pose=mount, preset=cfg.params.get("preset", "line_basic"))
+        elif cfg.type == "line_array":
+            sensor = LineSensorArray(cfg.name, mount_pose=mount, preset=cfg.params.get("preset", "line_basic"))
         elif cfg.type == "imu":
             sensor = IMUSensor(cfg.name)
         elif cfg.type == "encoder":
@@ -256,6 +276,136 @@ class Simulator:
             if sys.path and sys.path[0] == str(scenario_path):
                 sys.path.pop(0)
 
+    # --- Environment helpers ---------------------------------------------
+    def _inject_environment(self, world_cfg: WorldConfig) -> None:
+        drawings = getattr(world_cfg, "drawings", []) or []
+        bounds = getattr(world_cfg, "bounds", None)
+        for cfg in self._bound_body_configs(bounds):
+            sim_obj = self._make_body(cfg)
+            sim_obj.can_move = False
+            self.bodies[cfg.name] = sim_obj
+        for cfg in self._stroke_body_configs(drawings):
+            sim_obj = self._make_body(cfg)
+            sim_obj.can_move = False
+            self.bodies[cfg.name] = sim_obj
+        for obj in getattr(world_cfg, "shape_objects", []) or []:
+            cfg = getattr(obj, "body", None)
+            if not cfg:
+                continue
+            sim_obj = self._make_body(cfg)
+            sim_obj.can_move = False
+            self.bodies[cfg.name] = sim_obj
+        for obj in getattr(world_cfg, "custom_objects", []) or []:
+            cfg = getattr(obj, "body", None)
+            if not cfg:
+                continue
+            sim_obj = self._make_body(cfg)
+            sim_obj.can_move = False
+            self.bodies[cfg.name] = sim_obj
+
+    def _make_static_body_cfg(
+        self, name: str, points: List[Point], color: Tuple[int, int, int] = (120, 140, 160)
+    ) -> BodyConfig:
+        edges = [(i, (i + 1) % len(points)) for i in range(len(points))]
+        mat = MaterialConfig(
+            color=color,
+            friction=0.9,
+            restitution=0.05,
+            reflect_line=0.5,
+            reflect_distance=0.5,
+            roughness=0.7,
+            thickness=0.04,
+            custom={"color": color},
+        )
+        return BodyConfig(
+            name=name,
+            points=points,
+            edges=edges,
+            pose=(0.0, 0.0, 0.0),
+            can_move=False,
+            mass=10.0,
+            inertia=10.0,
+            material=mat,
+        )
+
+    def _bound_body_configs(self, bounds: Optional[EnvironmentBounds]) -> List[BodyConfig]:
+        if not bounds:
+            return []
+        min_x, max_x = bounds.min_x, bounds.max_x
+        min_y, max_y = bounds.min_y, bounds.max_y
+        thickness = 0.05
+        half = thickness / 2.0
+        walls = [
+            (
+                [
+                    (min_x - half, min_y - half),
+                    (max_x + half, min_y - half),
+                    (max_x + half, min_y + half),
+                    (min_x - half, min_y + half),
+                ],
+                "env_bound_bottom",
+            ),
+            (
+                [
+                    (min_x - half, max_y - half),
+                    (max_x + half, max_y - half),
+                    (max_x + half, max_y + half),
+                    (min_x - half, max_y + half),
+                ],
+                "env_bound_top",
+            ),
+            (
+                [
+                    (min_x - half, min_y - half),
+                    (min_x + half, min_y - half),
+                    (min_x + half, max_y + half),
+                    (min_x - half, max_y + half),
+                ],
+                "env_bound_left",
+            ),
+            (
+                [
+                    (max_x - half, min_y - half),
+                    (max_x + half, min_y - half),
+                    (max_x + half, max_y + half),
+                    (max_x - half, max_y + half),
+                ],
+                "env_bound_right",
+            ),
+        ]
+        return [self._make_static_body_cfg(name, pts, color=(90, 120, 170)) for pts, name in walls]
+
+    def _stroke_body_configs(self, drawings: Iterable[StrokeConfig]) -> List[BodyConfig]:
+        configs: List[BodyConfig] = []
+        seg_idx = 0
+        for stroke in drawings:
+            if getattr(stroke, "kind", "mark") != "wall":
+                continue
+            pts = list(getattr(stroke, "points", []) or [])
+            if len(pts) < 2:
+                continue
+            thickness = max(1e-4, float(getattr(stroke, "thickness", 0.05)))
+            color = tuple(getattr(stroke, "color", (160, 160, 180)))
+            for i in range(len(pts) - 1):
+                p0 = pts[i]
+                p1 = pts[i + 1]
+                dx = p1[0] - p0[0]
+                dy = p1[1] - p0[1]
+                seg_len = math.hypot(dx, dy)
+                if seg_len < 1e-6:
+                    continue
+                nx = -dy / seg_len * (thickness / 2.0)
+                ny = dx / seg_len * (thickness / 2.0)
+                rect = [
+                    (p0[0] + nx, p0[1] + ny),
+                    (p1[0] + nx, p1[1] + ny),
+                    (p1[0] - nx, p1[1] - ny),
+                    (p0[0] - nx, p0[1] - ny),
+                ]
+                configs.append(self._make_static_body_cfg(f"env_wall_{seg_idx}", rect, color=color))
+                seg_idx += 1
+        return configs
+
     # --- Stepping --------------------------------------------------------
     def step(self, dt: Optional[float] = None) -> None:
         if dt is None:
@@ -275,8 +425,35 @@ class Simulator:
         self._solve_contacts(dt)
         self._check_step_sanity(prev_poses, dt)
         self.last_motor_commands = {name: getattr(motor, "last_command", 0.0) for name, motor in self.motors.items()}
+        if self.trace_enabled:
+            self._record_trace(dt)
         self.time += dt
         self.step_index += 1
+
+    def enable_trace_logging(
+        self,
+        enabled: bool = True,
+        callback: Optional[Callable[[Dict[str, object]], None]] = None,
+        *,
+        clear_existing: bool = True,
+    ) -> None:
+        """Toggle per-step trace capture; optional callback for streaming."""
+        self.trace_enabled = enabled
+        self.trace_callback = callback
+        if clear_existing:
+            self.trace_log.clear()
+
+    def export_trace_log(self) -> List[Dict[str, object]]:
+        return list(self.trace_log)
+
+    def clear_trace_log(self) -> None:
+        self.trace_log.clear()
+
+    def save_trace_log(self, path: Path) -> None:
+        """Persist the current trace log to disk as JSON."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(self.trace_log, f, indent=2)
 
     def _update_sensors(self, dt: float) -> Dict[str, object]:
         readings: Dict[str, object] = {}
@@ -356,6 +533,45 @@ class Simulator:
                     body.pose = Pose2D(prev.x + dx * scale, prev.y + dy * scale, body.pose.theta)
                 else:
                     body.pose = prev
+
+    def _record_trace(self, dt: float) -> None:
+        entry: Dict[str, object] = {
+            "step": self.step_index,
+            "time": self.time,
+            "dt": dt,
+            "motors": {},
+            "bodies": {},
+        }
+        for name, motor in self.motors.items():
+            report = getattr(motor, "last_report", None)
+            entry["motors"][name] = {
+                "command": getattr(motor, "last_command", 0.0),
+                "slip_ratio": getattr(report, "slip_ratio", None) if report else None,
+                "lateral_slip": getattr(report, "lateral_slip", None) if report else None,
+                "wheel_speed": getattr(report, "wheel_speed", None) if report else None,
+                "preferred_speed": getattr(report, "preferred_speed", None) if report else None,
+                "contact_speed": getattr(report, "contact_speed", None) if report else None,
+                "contact_speed_after": getattr(report, "contact_speed_after", None) if report else None,
+                "applied_longitudinal_impulse": getattr(report, "applied_longitudinal_impulse", None) if report else None,
+                "applied_lateral_impulse": getattr(report, "applied_lateral_impulse", None) if report else None,
+                "applied_longitudinal_force": (
+                    getattr(report, "applied_longitudinal_impulse", 0.0) / dt if report and dt > 0 else None
+                ),
+                "applied_lateral_force": (
+                    getattr(report, "applied_lateral_impulse", 0.0) / dt if report and dt > 0 else None
+                ),
+                "normal_load": getattr(report, "normal_load", None) if report else None,
+                "step": getattr(report, "step", None) if report else None,
+            }
+        for name, body in self.bodies.items():
+            entry["bodies"][name] = {
+                "pose": body.pose.as_dict(),
+                "lin_vel": body.state.linear_velocity,
+                "ang_vel": body.state.angular_velocity,
+            }
+        self.trace_log.append(entry)
+        if self.trace_callback:
+            self.trace_callback(entry)
 
     def _integrate_bodies(self, dt: float) -> None:
         gx, gy = self.gravity

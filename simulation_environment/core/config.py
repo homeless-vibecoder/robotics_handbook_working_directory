@@ -16,11 +16,39 @@ class MaterialConfig:
     color: Tuple[int, int, int] = (180, 180, 180)
     roughness: float = 0.5
     friction: float = 0.8
+    traction: float | None = None
     restitution: float = 0.1
     reflect_line: float = 0.5
     reflect_distance: float = 0.5
     thickness: float = 0.02
     custom: Dict[str, object] = field(default_factory=dict)
+
+
+@dataclass
+class StrokeConfig:
+    kind: str = "mark"  # "mark" (visual) | "wall" (collision)
+    thickness: float = 0.05
+    points: List[Point] = field(default_factory=list)
+    color: Tuple[int, int, int] = (140, 180, 240)
+
+
+@dataclass
+class DesignerState:
+    """Lightweight persisted UI state for the designer."""
+
+    creation_context: str = "robot"  # robot | environment | custom
+    mode: str = "select"  # select | add | delete | draw | draw_shape | add_device
+    brush_kind: str = "mark"
+    brush_thickness: float = 0.05
+    shape_tool: str = "rect"  # rect | triangle | line
+
+
+@dataclass
+class EnvironmentBounds:
+    min_x: float = -1.0
+    min_y: float = -1.0
+    max_x: float = 1.0
+    max_y: float = 1.0
 
 
 @dataclass
@@ -93,6 +121,16 @@ class WorldObjectConfig:
 
 
 @dataclass
+class CustomObjectConfig:
+    """Standalone custom asset that can be placed in robot or environment."""
+
+    name: str
+    body: BodyConfig
+    kind: str = "custom"
+    metadata: Dict[str, object] = field(default_factory=dict)
+
+
+@dataclass
 class WorldConfig:
     name: str = "world"
     seed: Optional[int] = None
@@ -100,6 +138,11 @@ class WorldConfig:
     timestep: float = 1.0 / 120.0
     terrain: List[WorldObjectConfig] = field(default_factory=list)
     metadata: Dict[str, object] = field(default_factory=dict)
+    drawings: List[StrokeConfig] = field(default_factory=list)
+    bounds: Optional[EnvironmentBounds] = None
+    shape_objects: List[WorldObjectConfig] = field(default_factory=list)
+    custom_objects: List[CustomObjectConfig] = field(default_factory=list)
+    designer_state: DesignerState = field(default_factory=DesignerState)
 
 
 @dataclass
@@ -120,6 +163,14 @@ def _dataclass_from_dict(cls, data: Dict) -> object:
             inner = get_args(expected)[0]
             if hasattr(inner, "__dataclass_fields__"):
                 kwargs[key] = [_dataclass_from_dict(inner, v) for v in value]
+                continue
+        if origin is not None:
+            args = [a for a in get_args(expected) if a is not type(None)]
+            if len(args) == 1 and hasattr(args[0], "__dataclass_fields__"):
+                if value is None:
+                    kwargs[key] = None
+                else:
+                    kwargs[key] = _dataclass_from_dict(args[0], value)
                 continue
         if hasattr(expected, "__dataclass_fields__"):
             kwargs[key] = _dataclass_from_dict(expected, value)

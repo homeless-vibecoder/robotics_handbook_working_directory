@@ -2,32 +2,32 @@
   "panels": {
     "code": {
       "rect": [
-        735,
+        877,
         70,
-        535,
+        383,
         670
       ],
-      "dock": "right",
-      "visible": false
+      "dock": "floating",
+      "visible": true
     },
     "devices": {
       "rect": [
-        950,
-        338,
-        320,
-        218
+        865,
+        195,
+        382,
+        453
       ],
-      "dock": "right",
+      "dock": "floating",
       "visible": false
     },
     "state": {
       "rect": [
         20,
-        340,
-        549,
+        70,
+        413,
         670
       ],
-      "dock": "bottom",
+      "dock": "left",
       "visible": false
     },
     "logs": {
@@ -35,7 +35,7 @@
         20,
         70,
         476,
-        260
+        670
       ],
       "dock": "left",
       "visible": false
@@ -46,6 +46,16 @@
         351,
         496,
         318
+      ],
+      "dock": "floating",
+      "visible": false
+    },
+    "plot": {
+      "rect": [
+        400,
+        70,
+        420,
+        260
       ],
       "dock": "floating",
       "visible": false

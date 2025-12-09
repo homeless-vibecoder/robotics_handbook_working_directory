@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple, Optional, Dict
 import copy
+import math
 
 import pygame
 
@@ -12,28 +13,55 @@ from low_level_mechanics.geometry import Polygon
 
 
 def list_scenarios(base_path: Path) -> List[str]:
-    """Return scenario folder names that contain world.json and robot.json."""
+    """Return scenario folder names that contain either world/robot pairs or scenario descriptors."""
     names: List[str] = []
     if not base_path.exists():
         return names
     for entry in base_path.iterdir():
-        if entry.is_dir() and (entry / "world.json").exists() and (entry / "robot.json").exists():
+        if not entry.is_dir():
+            continue
+        has_pair = (entry / "world.json").exists() and (entry / "robot.json").exists()
+        has_descriptor = (entry / "scenario.json").exists()
+        if has_pair or has_descriptor:
             names.append(entry.name)
     return sorted(names)
 
 
-def world_to_screen(point: Tuple[float, float], viewport: pygame.Rect, scale: float, offset: Tuple[float, float]) -> Tuple[int, int]:
+def world_to_screen(
+    point: Tuple[float, float],
+    viewport: pygame.Rect,
+    scale: float,
+    offset: Tuple[float, float],
+    rotation: float = 0.0,
+) -> Tuple[int, int]:
     ox, oy = offset
     cx = viewport.x + viewport.width // 2
     cy = viewport.y + viewport.height // 2
-    return (int(cx + (point[0] + ox) * scale), int(cy - (point[1] + oy) * scale))
+    x, y = point[0] + ox, point[1] + oy
+    if rotation:
+        cos_r = math.cos(rotation)
+        sin_r = math.sin(rotation)
+        x, y = (x * cos_r - y * sin_r, x * sin_r + y * cos_r)
+    return (int(cx + x * scale), int(cy - y * scale))
 
 
-def screen_to_world(pos: Tuple[int, int], viewport: pygame.Rect, scale: float, offset: Tuple[float, float]) -> Tuple[float, float]:
+def screen_to_world(
+    pos: Tuple[int, int],
+    viewport: pygame.Rect,
+    scale: float,
+    offset: Tuple[float, float],
+    rotation: float = 0.0,
+) -> Tuple[float, float]:
     ox, oy = offset
     cx = viewport.x + viewport.width // 2
     cy = viewport.y + viewport.height // 2
-    return ((pos[0] - cx) / scale - ox, -(pos[1] - cy) / scale - oy)
+    x = (pos[0] - cx) / scale - ox
+    y = -(pos[1] - cy) / scale - oy
+    if rotation:
+        cos_r = math.cos(-rotation)
+        sin_r = math.sin(-rotation)
+        x, y = (x * cos_r - y * sin_r, x * sin_r + y * cos_r)
+    return (x, y)
 
 
 class HoverMenu:
@@ -51,6 +79,7 @@ class HoverMenu:
         self.header_h = 24
         self.padding = 10
         self.open_menu: Optional[int] = None
+        self.open_submenu: Optional[Tuple[int, int]] = None  # (menu_idx, entry_idx)
         self.header_rects: List[pygame.Rect] = []
         self.entry_rects: Dict[Tuple[int, int], pygame.Rect] = {}
         self.close_grace_ms = 160
@@ -79,6 +108,30 @@ class HoverMenu:
             y += self.header_h  # tight stacking
         return rects
 
+    def _submenu_entries_rects(self, menu_idx: int, entry_idx: int) -> List[pygame.Rect]:
+        rects: List[pygame.Rect] = []
+        if not self.header_rects:
+            self._compute_headers()
+        if menu_idx < 0 or menu_idx >= len(self.menus):
+            return rects
+        entries = self.menus[menu_idx][1]
+        if entry_idx < 0 or entry_idx >= len(entries):
+            return rects
+        children = entries[entry_idx].get("children")
+        if not isinstance(children, list) or not children:
+            return rects
+        parent_rects = self._menu_entries_rects(menu_idx)
+        if entry_idx >= len(parent_rects):
+            return rects
+        parent = parent_rects[entry_idx]
+        menu_w = max(self.font.size(c.get("label", ""))[0] + self.padding * 3 for c in children)
+        x = parent.right - 2
+        y = parent.y
+        for _ in children:
+            rects.append(pygame.Rect(x, y, menu_w, self.header_h))
+            y += self.header_h
+        return rects
+
     def handle_event(self, event: pygame.event.Event) -> bool:
         if not self.header_rects:
             self._compute_headers()
@@ -91,7 +144,20 @@ class HoverMenu:
                     break
             if self.open_menu is not None:
                 entry_rects = self._menu_entries_rects(self.open_menu)
+                entries = self.menus[self.open_menu][1]
+                hovered_child = None
                 for rect in entry_rects:
+                    if rect.collidepoint(event.pos):
+                        self._last_inside_ms = pygame.time.get_ticks()
+                        idx = entry_rects.index(rect)
+                        hovered_child = idx if entries[idx].get("children") else None
+                        break
+                if hovered_child is not None:
+                    self.open_submenu = (self.open_menu, hovered_child)
+                sub_rects: List[pygame.Rect] = []
+                if self.open_submenu:
+                    sub_rects = self._submenu_entries_rects(*self.open_submenu)
+                for rect in sub_rects:
                     if rect.collidepoint(event.pos):
                         self._last_inside_ms = pygame.time.get_ticks()
                         break
@@ -100,6 +166,7 @@ class HoverMenu:
             for i, rect in enumerate(self.header_rects):
                 if rect.collidepoint(event.pos):
                     self.open_menu = i if self.open_menu != i else None
+                    self.open_submenu = None
                     if self.open_menu is not None:
                         self._last_inside_ms = pygame.time.get_ticks()
                     return True
@@ -109,15 +176,35 @@ class HoverMenu:
                 entry_rects = self._menu_entries_rects(self.open_menu)
                 for j, rect in enumerate(entry_rects):
                     if rect.collidepoint(event.pos) and j < len(entries):
-                        action = entries[j].get("action")
+                        entry = entries[j]
+                        if entry.get("children"):
+                            self.open_submenu = (self.open_menu, j)
+                            return True
+                        action = entry.get("action")
                         if callable(action):
                             action()
-                        # Close after selection
                         self.open_menu = None
+                        self.open_submenu = None
                         return True
+                if self.open_submenu and self.open_submenu[0] == self.open_menu:
+                    menu_idx, entry_idx = self.open_submenu
+                    children = entries[entry_idx].get("children", [])
+                    sub_rects = self._submenu_entries_rects(menu_idx, entry_idx)
+                    for k, rect in enumerate(sub_rects):
+                        if rect.collidepoint(event.pos) and k < len(children):
+                            action = children[k].get("action")
+                            if callable(action):
+                                action()
+                            self.open_menu = None
+                            self.open_submenu = None
+                            return True
                 # Click away closes
-                if not any(rect.collidepoint(event.pos) for rect in entry_rects):
+                if not any(rect.collidepoint(event.pos) for rect in entry_rects) and not any(
+                    rect.collidepoint(event.pos)
+                    for rect in (self._submenu_entries_rects(*self.open_submenu) if self.open_submenu else [])
+                ):
                     self.open_menu = None
+                    self.open_submenu = None
         return False
 
     def update_hover(self, mouse_pos: Tuple[int, int]) -> None:
@@ -128,8 +215,12 @@ class HoverMenu:
             self._compute_headers()
         in_header = any(rect.collidepoint(mouse_pos) for rect in self.header_rects)
         entry_rects = self._menu_entries_rects(self.open_menu)
+        submenu_rects: List[pygame.Rect] = []
+        if self.open_submenu and self.open_submenu[0] == self.open_menu:
+            submenu_rects = self._submenu_entries_rects(*self.open_submenu)
         in_menu = any(rect.collidepoint(mouse_pos) for rect in entry_rects)
-        if in_header or in_menu:
+        in_submenu = any(rect.collidepoint(mouse_pos) for rect in submenu_rects)
+        if in_header or in_menu or in_submenu:
             self._last_inside_ms = now
             return
         # Add a tolerance band below the header to reduce accidental closes while moving into the menu.
@@ -143,6 +234,7 @@ class HoverMenu:
             return
         if now - self._last_inside_ms > self.close_grace_ms:
             self.open_menu = None
+            self.open_submenu = None
 
     def draw(self, surface: pygame.Surface) -> None:
         if not self.header_rects:
@@ -152,8 +244,8 @@ class HoverMenu:
             label = self.menus[i][0]
             active = self.open_menu == i
             bg = (40, 44, 52) if active else (30, 32, 36)
-            pygame.draw.rect(surface, bg, rect)
-            pygame.draw.rect(surface, (90, 110, 130), rect, 1)
+            pygame.draw.rect(surface, bg, rect, border_radius=6)
+            pygame.draw.rect(surface, (90, 110, 130), rect, 1, border_radius=6)
             surface.blit(self.font.render(label, True, (210, 220, 230)), (rect.x + self.padding - 2, rect.y + 4))
         if self.open_menu is None:
             return
@@ -169,12 +261,41 @@ class HoverMenu:
                     checked = bool(checker())
                 except Exception:
                     checked = False
-            pygame.draw.rect(surface, (26, 28, 32), rect)
-            pygame.draw.rect(surface, (80, 100, 120), rect, 1)
+            pygame.draw.rect(surface, (26, 28, 32), rect, border_radius=6)
+            pygame.draw.rect(surface, (80, 100, 120), rect, 1, border_radius=6)
             box = pygame.Rect(rect.x + self.padding - 2, rect.y + 6, 12, 12)
             if checked:
                 pygame.draw.rect(surface, (120, 200, 150), box.inflate(-2, -2))
-            surface.blit(self.font.render(label, True, (210, 220, 230)), (box.right + self.padding // 2, rect.y + 4))
+            suffix = " ›" if entry.get("children") else ""
+            surface.blit(
+                self.font.render(label + suffix, True, (210, 220, 230)),
+                (box.right + self.padding // 2, rect.y + 4),
+            )
+        if self.open_submenu and self.open_submenu[0] == self.open_menu:
+            entries = self.menus[self.open_menu][1]
+            parent_idx = self.open_submenu[1]
+            if 0 <= parent_idx < len(entries):
+                children = entries[parent_idx].get("children", [])
+                sub_rects = self._submenu_entries_rects(self.open_menu, parent_idx)
+                for k, rect in enumerate(sub_rects):
+                    child = children[k]
+                    label = child.get("label", "")
+                    checked = False
+                    checker = child.get("checked")
+                    if callable(checker):
+                        try:
+                            checked = bool(checker())
+                        except Exception:
+                            checked = False
+                    pygame.draw.rect(surface, (22, 24, 28), rect, border_radius=6)
+                    pygame.draw.rect(surface, (70, 90, 110), rect, 1, border_radius=6)
+                    box = pygame.Rect(rect.x + self.padding - 2, rect.y + 6, 12, 12)
+                    if checked:
+                        pygame.draw.rect(surface, (120, 200, 150), box.inflate(-2, -2))
+                    surface.blit(
+                        self.font.render(str(label), True, (210, 220, 230)),
+                        (box.right + self.padding // 2, rect.y + 4),
+                    )
 
 
 def draw_polygon(
@@ -185,10 +306,11 @@ def draw_polygon(
     scale: float,
     offset: Tuple[float, float],
     outline: Tuple[int, int, int] = (30, 30, 30),
+    rotation: float = 0.0,
     pose=None,
 ) -> None:
     verts = poly._world_vertices(pose) if pose is not None else poly.vertices
-    pts = [world_to_screen(v, viewport, scale, offset) for v in verts]
+    pts = [world_to_screen(v, viewport, scale, offset, rotation) for v in verts]
     if len(pts) >= 3:
         pygame.draw.polygon(surface, color, pts, 0)
         pygame.draw.lines(surface, outline, True, pts, 2)

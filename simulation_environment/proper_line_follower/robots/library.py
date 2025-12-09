@@ -152,6 +152,8 @@ def create_robot(
         wheel_base=spec.wheel_base,
         detailed=spec.detailed_drive,
         max_force=spec.drive_max_force,
+        mu_long=spec.tire_traction,
+        mu_lat=spec.tire_friction,
     )
     left_sensor = BinaryLineSensor(
         name=f"{name}_line_left",

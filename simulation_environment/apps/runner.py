@@ -12,10 +12,19 @@ from typing import Optional, List, Dict, Callable, Set, Tuple
 
 import pygame
 import pygame_gui
+from pygame_gui.windows import UIFileDialog
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from core import load_scenario, Simulator, save_snapshot, load_snapshot  # noqa: E402
+from core import load_scenario, save_scenario, load_robot_design, Simulator, save_snapshot, load_snapshot  # noqa: E402
+from core.config import WorldConfig, RobotConfig  # noqa: E402
+from apps.help_content import (  # noqa: E402
+    HELP_TOPICS,
+    CAPTURE_MENU_LABELS,
+    ROUNDING_DIGITS,
+    serialize_help_topics,
+    serialize_capture_menu,
+)
 from apps.shared_ui import list_scenarios, SimpleTextEditor, world_to_screen, screen_to_world, HoverMenu  # noqa: E402
 from low_level_mechanics.geometry import Polygon  # noqa: E402
 
@@ -77,7 +86,10 @@ class RunnerApp:
         self.scenario_names = list_scenarios(self.scenario_root)
         self.scenario_name = self.scenario_names[0] if self.scenario_names else None
         self.sim: Optional[Simulator] = None
+        self.world_cfg: Optional[WorldConfig] = None
+        self.robot_cfg: Optional[RobotConfig] = None
         self._sim_time_accum = 0.0
+        self.playback_rate: float = 1.0
         # Layout parameters
         self.viewport_min = 520
         self.panel_header_h = 28
@@ -86,7 +98,7 @@ class RunnerApp:
         self.offset = (0.0, 0.0)
         self.pan_active = False
         self.pan_start: Optional[Tuple[int, int]] = None
-        self.view_options = {"grid": False, "motor_arrows": True}
+        self.view_options = {"grid": False, "motor_arrows": True, "path_trace": False}
         # Panel/docking state
         self.dock_items: Dict[str, DockItem] = {}
         self.panel_inner_rects: Dict[str, pygame.Rect] = {}
@@ -102,23 +114,21 @@ class RunnerApp:
         self.panel_menu_anchor = "right"
         self.dock_z_counter = 0
         self.panel_layout_path = self.base_path / "runner_layout.json"
-        self.reposition_mode = False
-        self.reposition_dragging = False
         self.reposition_target: Optional[Tuple[float, float]] = None
         self.reposition_angle: float = 0.0
-        self.show_device_help = True
         self._stepped_this_frame = False
         self.robot_dragging = False
         self.robot_drag_start: Optional[Tuple[float, float]] = None
         self.robot_drag_center: Optional[Tuple[float, float]] = None
         self.robot_drag_theta: float = 0.0
         self.hover_robot_center: bool = False
+        self.show_device_help = True
         self.pose_history: List[Tuple[float, float, float]] = []
         self.pose_redo: List[Tuple[float, float, float]] = []
         self.error_log: List[Dict[str, str]] = []
         self.console_lines: List[str] = []
         self._console_buffer: str = ""
-        self.device_help_lines: List[str] = []
+        self.path_trace: List[Tuple[float, float]] = []
         self.live_state: Dict[str, Dict[str, object]] = {"motors": {}, "sensors": {}}
         self.logger_selected: Set[str] = set()
         self.logger_samples: List[Dict[str, object]] = []
@@ -129,12 +139,36 @@ class RunnerApp:
         self._logger_elapsed = 0.0
         self.logger_status = "Logger idle"
         self.signal_hitboxes: Dict[str, pygame.Rect] = {}
+        self.plot_data: Dict[str, List[Optional[float]]] = {}
+        self.plot_selected_cols: Set[str] = set()
+        self.plot_source: Optional[Path] = None
+        self.plot_status: str = "No CSV loaded"
+        self.plot_hitboxes: Dict[str, pygame.Rect] = {}
+        self.plot_dialog: Optional[UIFileDialog] = None
+        self.speed_slider_window: Optional[pygame_gui.elements.UIWindow] = None
+        self.speed_slider: Optional[pygame_gui.elements.UIHorizontalSlider] = None
+        self.speed_label: Optional[pygame_gui.elements.UILabel] = None
+        self.robot_dialog: Optional[UIFileDialog] = None
+        self.round_digits = ROUNDING_DIGITS
+        self.help_topics = HELP_TOPICS
+        self.help_open = False
+        self.help_active_topic = self.help_topics[0]["id"] if self.help_topics else None
+        self.help_scroll = 0
+        self.help_scroll_min = 0
+        self.help_last_content_height = 0
+        self.help_nav_hitboxes: Dict[str, pygame.Rect] = {}
+        self.help_content_rect: Optional[pygame.Rect] = None
+        self.help_close_rect: Optional[pygame.Rect] = None
+        self.capture_menu_labels = CAPTURE_MENU_LABELS
+        self.snapshot_dialog: Optional[UIFileDialog] = None
+        self.snapshot_dialog_mode: Optional[str] = None
         # Reserve bottom space in the right column for error drawer.
         self.viewport_rect = pygame.Rect(0, 0, 0, 0)  # set in _update_layout
         self.editor_rect = pygame.Rect(0, 0, 0, 0)
         self.status_text = "Ctrl+S to save + reload; Format for styling"
         self._orig_stdout = sys.stdout
         sys.stdout = _ConsoleTee(sys.stdout, self._append_console)
+        self.view_rotation: float = 0.0
 
         self._build_ui()
         self._init_dock_panels()
@@ -159,12 +193,6 @@ class RunnerApp:
         )
         self.btn_step = pygame_gui.elements.UIButton(
             pygame.Rect((450, 20), (80, 30)), "Step", manager=self.manager
-        )
-        self.btn_snap = pygame_gui.elements.UIButton(
-            pygame.Rect((540, 20), (140, 30)), "Save snapshot", manager=self.manager
-        )
-        self.btn_load_snap = pygame_gui.elements.UIButton(
-            pygame.Rect((690, 20), (140, 30)), "Load snapshot", manager=self.manager
         )
         self.btn_reload_code = pygame_gui.elements.UIButton(
             pygame.Rect((840, 20), (120, 30)), "Reload code", manager=self.manager
@@ -204,26 +232,12 @@ class RunnerApp:
             relative_rect=pygame.Rect((0, 0), (120, 28)),
             manager=self.manager,
         )
-        self.btn_reposition_mode = pygame_gui.elements.UIButton(
-            pygame.Rect((0, 0), (150, 28)), "Reposition robot", manager=self.manager
-        )
-        self.btn_reset_pose = pygame_gui.elements.UIButton(
-            pygame.Rect((0, 0), (140, 28)), "Reset to spawn", manager=self.manager
-        )
-        self.btn_set_spawn = pygame_gui.elements.UIButton(
-            pygame.Rect((0, 0), (140, 28)), "Save as spawn", manager=self.manager
-        )
-        self.btn_toggle_help = pygame_gui.elements.UIButton(
-            pygame.Rect((0, 0), (150, 28)), "Hide device help", manager=self.manager
-        )
         # Hide old top-row buttons; hover menus will replace them.
         for btn in [
             self.dropdown,
             self.btn_reload_scenario,
             self.btn_play,
             self.btn_step,
-            self.btn_snap,
-            self.btn_load_snap,
             self.btn_reload_code,
             self.btn_save_code,
             self.btn_format_code,
@@ -266,37 +280,23 @@ class RunnerApp:
                 True,
                 (280, 200),
             ),
+            "plot": DockItem(
+                "plot",
+                "CSV Plot",
+                pygame.Rect(base_x - right_w - 20, 70, right_w, 260),
+                "floating",
+                False,
+                (300, 220),
+            ),
         }
         for i, item in enumerate(self.dock_items.values()):
             item.z = i
         self.panel_inner_rects = {}
 
     def _init_hover_menu(self) -> None:
-        font = pygame.font.Font(pygame.font.get_default_font(), 14)
-        self.hover_menu = HoverMenu(
-            [
-                (
-                    "View",
-                    [
-                        {"label": "Reset view", "action": self._view_reset},
-                        {"label": "Center robot", "action": self._view_center_robot},
-                        {
-                            "label": "Toggle grid",
-                            "action": self._view_toggle_grid,
-                            "checked": lambda: self.view_options.get("grid", False),
-                        },
-                        {
-                            "label": "Toggle motor arrows",
-                            "action": self._view_toggle_motor_arrows,
-                            "checked": lambda: self.view_options.get("motor_arrows", True),
-                        },
-                        {"label": "Reposition robot", "action": self._view_reposition},
-                    ],
-                )
-            ],
-            pos=(20, 8),
-            font=font,
-        )
+        # Initialize hover menu with the dynamic builder.
+        self.hover_menu = None
+        self._refresh_hover_menu()
 
     # Menu helpers (shared actions for hover menu)
     def _toggle_play(self) -> None:
@@ -327,6 +327,47 @@ class RunnerApp:
                 self._record_error("Controller error", self.sim.last_controller_error)
                 self.sim.clear_controller_error()
         self._refresh_hover_menu()
+
+    def _set_playback_rate(self, value: float) -> None:
+        self.playback_rate = max(0.05, float(value))
+        if self.speed_slider:
+            self.speed_slider.set_current_value(self.playback_rate)
+        if self.speed_label:
+            self.speed_label.set_text(f"Speed: {self.playback_rate:.2f}x")
+        self.status_text = f"Speed {self.playback_rate:.2f}x"
+        self._refresh_hover_menu()
+
+    def _open_speed_slider(self) -> None:
+        if self.speed_slider_window:
+            try:
+                self.speed_slider_window.kill()
+            except Exception:
+                pass
+        self.speed_slider_window = None
+        self.speed_slider = None
+        self.speed_label = None
+        win_rect = pygame.Rect((self.window_size[0] - 320, 70), (280, 120))
+        self.speed_slider_window = pygame_gui.elements.UIWindow(
+            rect=win_rect,
+            manager=self.manager,
+            window_display_title="Sim speed",
+            object_id="#speed_slider_window",
+        )
+        self.speed_slider = pygame_gui.elements.UIHorizontalSlider(
+            relative_rect=pygame.Rect(16, 50, win_rect.width - 32, 20),
+            start_value=self.playback_rate,
+            value_range=(0.1, 4.0),
+            manager=self.manager,
+            container=self.speed_slider_window,
+            object_id="#speed_slider",
+        )
+        self.speed_label = pygame_gui.elements.UILabel(
+            relative_rect=pygame.Rect(16, 20, win_rect.width - 32, 20),
+            text=f"Speed: {self.playback_rate:.2f}x",
+            manager=self.manager,
+            container=self.speed_slider_window,
+            object_id="#speed_slider_label",
+        )
 
     def _reload_code(self) -> None:
         if self.sim:
@@ -452,22 +493,6 @@ class RunnerApp:
                 text = controller.read_text(encoding="utf-8")
         return SimpleTextEditor(rect, font, text)
 
-    def _refresh_device_help(self) -> None:
-        lines: List[str] = []
-        if not self.sim:
-            self.device_help_lines = lines
-            return
-        motor_names = list(self.sim.motors.keys())
-        sensor_items = []
-        for name, sensor in self.sim.sensors.items():
-            stype = getattr(sensor, "visual_tag", "") or sensor.__class__.__name__
-            sensor_items.append(f"{name} ({stype})")
-        lines.append(f"Motors: {', '.join(motor_names) if motor_names else 'none'}")
-        lines.append(f"Sensors: {', '.join(sensor_items) if sensor_items else 'none'}")
-        lines.append("Readings in step(): sensors['name']")
-        lines.append("Command: sim.motors['name'].command(v, sim, dt)")
-        self.device_help_lines = lines[:4]
-
     def _prime_logger_signals(self) -> None:
         self.logger_selected = set()
         if not self.sim:
@@ -555,10 +580,6 @@ class RunnerApp:
             self.btn_logger_export,
             self.dropdown_logger_rate,
             self.dropdown_logger_duration,
-            self.btn_reposition_mode,
-            self.btn_reset_pose,
-            self.btn_set_spawn,
-            self.btn_toggle_help,
             self.btn_clear_errors,
             self.btn_toggle_panel,
         ]
@@ -573,34 +594,7 @@ class RunnerApp:
                 self.editor.rect = self.editor_rect
                 self.editor.scroll_offset = min(self.editor.scroll_offset, max(0, len(self.editor.lines) - 1))
 
-        # Devices panel
-        if self._panel_visible("devices"):
-            item = self.dock_items["devices"]
-            self.btn_toggle_help.show()
-            self.btn_toggle_help.set_relative_position((item.rect.x + 8, item.rect.y + self.panel_header_h + 4))
-
         # State panel controls
-        if self._panel_visible("state"):
-            item = self.dock_items["state"]
-            x = item.rect.x + 8
-            row_y = item.rect.y + self.panel_header_h + 6
-            self.btn_logger_toggle.show()
-            self.btn_logger_toggle.set_relative_position((x, row_y))
-            self.btn_logger_export.show()
-            self.btn_logger_export.set_relative_position((x + 160, row_y))
-            row_y += 32
-            self.dropdown_logger_rate.show()
-            self.dropdown_logger_rate.set_relative_position((x, row_y))
-            self.dropdown_logger_duration.show()
-            self.dropdown_logger_duration.set_relative_position((x + 120, row_y))
-            row_y += 32
-            self.btn_reposition_mode.show()
-            self.btn_reposition_mode.set_relative_position((x, row_y))
-            self.btn_reset_pose.show()
-            self.btn_reset_pose.set_relative_position((x + 158, row_y))
-            self.btn_set_spawn.show()
-            self.btn_set_spawn.set_relative_position((x + 310, row_y))
-
         # Logs/errors
         if self._panel_visible("logs"):
             item = self.dock_items["logs"]
@@ -739,9 +733,14 @@ class RunnerApp:
             return
         self._clear_errors()
         self._clear_console()
+        self._clear_plot_data()
+        self.world_cfg = None
+        self.robot_cfg = None
         scenario_path = self.scenario_root / self.scenario_name
         try:
             world_cfg, robot_cfg = load_scenario(scenario_path)
+            self.world_cfg = world_cfg
+            self.robot_cfg = robot_cfg
             self.sim = Simulator()
             self.sim.load(
                 scenario_path,
@@ -755,6 +754,7 @@ class RunnerApp:
             return
         self.status_text = f"Loaded scenario '{self.scenario_name}'"
         self._sim_time_accum = 0.0
+        self.path_trace = []
         # refresh editor text
         controller = scenario_path / "controller.py"
         if controller.exists():
@@ -762,7 +762,43 @@ class RunnerApp:
         if self.sim and self.sim.last_controller_error:
             self._record_error("Controller import failed", self.sim.last_controller_error)
             self.sim.clear_controller_error()
-        self._refresh_device_help()
+        self._prime_logger_signals()
+        pose = self._robot_pose_now()
+        if pose:
+            self.pose_history = [pose]
+            self.pose_redo.clear()
+        self._refresh_hover_menu()
+
+    def _reload_with_current_assets(self) -> None:
+        """Reload sim using current in-memory world/robot without reloading files."""
+        if not (self.scenario_name and self.world_cfg and self.robot_cfg):
+            self.status_text = "Load a scenario before reloading"
+            return
+        self._clear_errors()
+        self._clear_console()
+        self._clear_plot_data()
+        scenario_path = self.scenario_root / self.scenario_name
+        try:
+            self.sim = Simulator()
+            self.sim.load(
+                scenario_path,
+                self.world_cfg,
+                self.robot_cfg,
+                top_down=self.top_down_mode,
+                ignore_terrain=self.force_empty_world,
+            )
+        except Exception:
+            self._record_error("Scenario reload failed", traceback.format_exc())
+            return
+        self.status_text = f"Reloaded scenario '{self.scenario_name}'"
+        self._sim_time_accum = 0.0
+        self.path_trace = []
+        controller = scenario_path / "controller.py"
+        if controller.exists():
+            self.editor.set_text(controller.read_text(encoding="utf-8"))
+        if self.sim and self.sim.last_controller_error:
+            self._record_error("Controller import failed", self.sim.last_controller_error)
+            self.sim.clear_controller_error()
         self._prime_logger_signals()
         pose = self._robot_pose_now()
         if pose:
@@ -819,12 +855,14 @@ class RunnerApp:
                         self.manager.set_window_resolution(self.window_size)
                         self._update_layout()
                     if event.type == pygame.MOUSEBUTTONDOWN:
+                        if self._handle_help_mouse(event):
+                            continue
                         if self.hover_menu and self.hover_menu.handle_event(event):
                             continue
                         if self._handle_dock_mouse_down(event):
                             continue
                         self._handle_state_click(event)
-                        self._handle_reposition_click(event)
+                        self._handle_plot_click(event)
                         self._handle_pan_start(event)
                     if event.type == pygame.MOUSEBUTTONUP:
                         if event.button in (1, 2, 3):
@@ -840,6 +878,8 @@ class RunnerApp:
                             continue
                         self._handle_pan_motion(event)
                     if event.type == pygame.MOUSEWHEEL:
+                        if self._handle_help_mouse(event):
+                            continue
                         self._handle_scroll(event)
                     if event.type == pygame.KEYDOWN:
                         mods = getattr(event, "mod", 0)
@@ -857,10 +897,11 @@ class RunnerApp:
                 if self.playing and self.sim:
                     try:
                         sim_dt = self.sim.dt
-                        # Accumulate time with a small cap to avoid spiraling after stalls.
-                        self._sim_time_accum = min(self._sim_time_accum + dt, sim_dt * 8.0)
+                        # Accumulate time scaled by playback_rate with a cap to avoid runaway after stalls.
+                        rate = max(0.05, min(self.playback_rate, 8.0))
+                        self._sim_time_accum = min(self._sim_time_accum + dt * rate, sim_dt * 8.0 * rate)
                         steps = 0
-                        while self._sim_time_accum >= sim_dt and steps < 8:
+                        while self._sim_time_accum >= sim_dt and steps < 8 * max(1, int(rate)):
                             self.sim.step(sim_dt)
                             self._sim_time_accum -= sim_dt
                             steps += 1
@@ -883,6 +924,39 @@ class RunnerApp:
         pygame.quit()
 
     def _handle_ui_event(self, event: pygame.event.Event) -> None:
+        if event.type == pygame_gui.UI_FILE_DIALOG_PATH_PICKED:
+            if self.snapshot_dialog and event.ui_element == self.snapshot_dialog:
+                path = Path(event.text)
+                if self.snapshot_dialog_mode == "save":
+                    self._save_snapshot_to_path(path)
+                else:
+                    self._load_snapshot_from_path(path)
+                self.snapshot_dialog = None
+                self.snapshot_dialog_mode = None
+            elif self.plot_dialog and event.ui_element == self.plot_dialog:
+                self._load_plot_from_path(Path(event.text))
+                self.plot_dialog = None
+            elif self.robot_dialog and event.ui_element == self.robot_dialog:
+                self._load_robot_from_path(Path(event.text))
+                self.robot_dialog = None
+            return
+        if event.type == pygame_gui.UI_WINDOW_CLOSE:
+            if self.snapshot_dialog and event.ui_element == self.snapshot_dialog:
+                self.snapshot_dialog = None
+                self.snapshot_dialog_mode = None
+            if self.speed_slider_window and event.ui_element == self.speed_slider_window:
+                self.speed_slider_window = None
+                self.speed_slider = None
+                self.speed_label = None
+            if self.robot_dialog and event.ui_element == self.robot_dialog:
+                self.robot_dialog = None
+                return
+        if event.type == pygame_gui.UI_HORIZONTAL_SLIDER_MOVED and self.speed_slider and event.ui_element == self.speed_slider:
+            self._set_playback_rate(float(event.value))
+            return
+            if self.plot_dialog and event.ui_element == self.plot_dialog:
+                self.plot_dialog = None
+                return
         if event.type == pygame_gui.UI_DROP_DOWN_MENU_CHANGED:
             if event.ui_element == self.dropdown:
                 self.scenario_name = event.text if event.text != "<none>" else None
@@ -913,10 +987,6 @@ class RunnerApp:
                 if self.sim and self.sim.last_controller_error:
                     self._record_error("Controller error", self.sim.last_controller_error)
                     self.sim.clear_controller_error()
-        elif event.ui_element == self.btn_snap:
-            self._save_snapshot()
-        elif event.ui_element == self.btn_load_snap:
-            self._load_snapshot()
         elif event.ui_element == self.btn_reload_code:
             if self.sim:
                 self.sim.clear_controller_error()
@@ -936,18 +1006,6 @@ class RunnerApp:
             self._toggle_logging()
         elif event.ui_element == self.btn_logger_export:
             self._export_logger()
-        elif event.ui_element == self.btn_reposition_mode:
-            self.reposition_mode = not self.reposition_mode
-            self.status_text = "Reposition mode on" if self.reposition_mode else "Reposition mode off"
-        elif event.ui_element == self.btn_reset_pose:
-            self._reset_pose()
-        elif event.ui_element == self.btn_set_spawn:
-            self._save_spawn_pose()
-        elif event.ui_element == self.btn_toggle_help:
-            self.show_device_help = not self.show_device_help
-            self.btn_toggle_help.set_text("Show device help" if not self.show_device_help else "Hide device help")
-            self.status_text = "Device help hidden" if not self.show_device_help else "Device help visible"
-            self._update_layout()
 
     def _record_error(self, title: str, details: str, pause: bool = True) -> None:
         entry: Dict[str, str] = {"title": title, "details": details}
@@ -1008,6 +1066,62 @@ class RunnerApp:
             lines.append(current)
         return lines
 
+    def _fmt_value(self, value: object) -> str:
+        """Format numeric-ish values with consistent rounding for display."""
+        decimals = max(1, self.round_digits)
+        small_decimals = min(decimals + 1, 4)
+        if isinstance(value, dict):
+            parts = [f"{k}: {self._fmt_value(v)}" for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))]
+            return "{" + ", ".join(parts) + "}"
+        if isinstance(value, set):
+            parts = [self._fmt_value(v) for v in sorted(value, key=lambda v: str(v))]
+            return "{" + ", ".join(parts) + "}"
+        try:
+            if isinstance(value, (list, tuple)):
+                return "(" + ", ".join(self._fmt_value(v) for v in value) + ")"
+            num = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        places = small_decimals if 0 < abs(num) < 1 else decimals
+        fmt = f"{{0:.{places}f}}"
+        return fmt.format(num)
+
+    def _toggle_help_overlay(self) -> None:
+        self.help_open = not self.help_open
+        if self.help_open:
+            self.help_scroll = 0
+        self.status_text = "Help open" if self.help_open else "Help closed"
+        self._refresh_hover_menu()
+
+    def _open_help_topic(self, topic_id: str) -> None:
+        if any(t["id"] == topic_id for t in self.help_topics):
+            self.help_active_topic = topic_id
+            self.help_scroll = 0
+
+    def _clamp_help_scroll(self, content_height: int, viewport_h: int) -> None:
+        self.help_scroll_min = min(0, viewport_h - content_height - 12)
+        if self.help_scroll < self.help_scroll_min:
+            self.help_scroll = self.help_scroll_min
+        if self.help_scroll > 0:
+            self.help_scroll = 0
+
+    def _handle_help_mouse(self, event: pygame.event.Event) -> bool:
+        if not self.help_open:
+            return False
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            if self.help_close_rect and self.help_close_rect.collidepoint(event.pos):
+                self._toggle_help_overlay()
+                return True
+            for tid, rect in self.help_nav_hitboxes.items():
+                if rect.collidepoint(event.pos):
+                    self._open_help_topic(tid)
+                    return True
+        if event.type == pygame.MOUSEWHEEL and self.help_content_rect:
+            self.help_scroll += event.y * 24
+            self._clamp_help_scroll(self.help_last_content_height, self.help_content_rect.height)
+            return True
+        return False
+
     def _update_live_state(self, sim_dt: float, stepped: bool) -> None:
         if not self.sim:
             self.live_state = {"motors": {}, "sensors": {}}
@@ -1015,6 +1129,15 @@ class RunnerApp:
         motors = {name: getattr(motor, "last_command", 0.0) for name, motor in self.sim.motors.items()}
         sensors = dict(getattr(self.sim, "last_sensor_readings", {}) or {})
         self.live_state = {"motors": motors, "sensors": sensors, "physics_warning": getattr(self.sim, "last_physics_warning", None)}
+        if self.view_options.get("path_trace", False) and stepped:
+            center = self._current_robot_center()
+            if center:
+                self.path_trace.append(center)
+                if len(self.path_trace) > 400:
+                    self.path_trace = self.path_trace[-400:]
+        elif not self.view_options.get("path_trace", False):
+            if self.path_trace:
+                self.path_trace.clear()
         if self.logger_enabled and stepped:
             self._logger_timer += sim_dt
             self._logger_elapsed += sim_dt
@@ -1092,9 +1215,6 @@ class RunnerApp:
                 self.reposition_target = (center[0] + dx, center[1] + dy)
                 self._apply_robot_reposition(self.reposition_target, self.robot_drag_theta)
             return
-        if self.reposition_dragging and self.reposition_mode and self.viewport_rect.collidepoint(event.pos):
-            self.reposition_target = screen_to_world(event.pos, self.viewport_rect, self.scale, self.offset)
-            return
         if self.pan_active and self.pan_start:
             dx = (event.pos[0] - self.pan_start[0]) / max(self.scale, 1e-6)
             dy = (event.pos[1] - self.pan_start[1]) / max(self.scale, 1e-6)
@@ -1123,9 +1243,11 @@ class RunnerApp:
         self.view_options["motor_arrows"] = not self.view_options["motor_arrows"]
         self.status_text = "Motor arrows on" if self.view_options["motor_arrows"] else "Motor arrows off"
 
-    def _view_reposition(self) -> None:
-        self.reposition_mode = True
-        self.status_text = "Reposition: click-drag in viewport to place robot"
+    def _view_toggle_path_trace(self) -> None:
+        self.view_options["path_trace"] = not self.view_options["path_trace"]
+        if not self.view_options["path_trace"]:
+            self.path_trace.clear()
+        self.status_text = "Path trace on" if self.view_options["path_trace"] else "Path trace off"
 
     def _current_robot_center(self) -> Optional[Tuple[float, float]]:
         if not self.sim or not self.sim.robot_cfg or not self.sim.robot_cfg.bodies:
@@ -1150,34 +1272,17 @@ class RunnerApp:
         sx, sy = world_to_screen(center, self.viewport_rect, self.scale, self.offset)
         self.hover_robot_center = math.hypot(mouse_pos[0] - sx, mouse_pos[1] - sy) <= 14
 
-    def _handle_reposition_click(self, event: pygame.event.Event) -> None:
-        # legacy reposition button support (not needed for direct drag)
-        if self.reposition_mode and event.button == 1 and self.viewport_rect.collidepoint(event.pos):
-            world_point = screen_to_world(event.pos, self.viewport_rect, self.scale, self.offset)
-            spawn = self._spawn_from_body()
-            if spawn:
-                self.reposition_angle = spawn[2]
-            self.reposition_dragging = True
-            self.reposition_target = world_point
-            self.status_text = "Drag to set robot start; release to apply"
-
     def _finalize_reposition(self) -> None:
         if self.robot_dragging:
             self.robot_dragging = False
-            self.reposition_dragging = False
             self.robot_drag_start = None
             self.robot_drag_center = None
-            self.status_text = "Robot moved; play or save spawn"
+            self.status_text = "Robot moved; resume or snapshot to test"
             # record final pose for undo/redo
             pose = self._robot_pose_now()
             if pose:
                 self._push_pose_history(pose)
             return
-        if not (self.reposition_mode and self.reposition_target and self.sim):
-            return
-        self._apply_robot_reposition(self.reposition_target, self.reposition_angle)
-        self.reposition_dragging = False
-        self.status_text = "Robot moved; play or save spawn"
 
     def _apply_robot_reposition(self, pos: Tuple[float, float], theta: float) -> None:
         if not self.sim:
@@ -1186,15 +1291,6 @@ class RunnerApp:
         self.btn_play.set_text("Play")
         self.sim.reposition_robot((pos[0], pos[1], theta), zero_velocity=True, set_as_spawn=False)
         self.reposition_target = pos
-
-    def _spawn_from_body(self) -> Optional[Tuple[float, float, float]]:
-        if not self.sim or not self.sim.robot_cfg or not self.sim.robot_cfg.bodies:
-            return None
-        root_cfg = self.sim.robot_cfg.bodies[0]
-        body = self.sim.bodies.get(root_cfg.name)
-        if not body:
-            return None
-        return (body.pose.x - root_cfg.pose[0], body.pose.y - root_cfg.pose[1], body.pose.theta - root_cfg.pose[2])
 
     def _robot_pose_now(self) -> Optional[Tuple[float, float, float]]:
         if not self.sim or not self.sim.robot_cfg or not self.sim.robot_cfg.bodies:
@@ -1250,6 +1346,25 @@ class RunnerApp:
                     self.logger_selected.add(sig)
                 return
 
+    def _handle_plot_click(self, event: pygame.event.Event) -> None:
+        if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
+            return
+        panel = self.dock_items.get("plot")
+        if not panel or not panel.visible or not panel.rect.collidepoint(event.pos):
+            return
+        for key, rect in self.plot_hitboxes.items():
+            if rect.collidepoint(event.pos):
+                if key == "__open__":
+                    self._open_plot_dialog()
+                elif key == "__clear__":
+                    self._clear_plot_data()
+                else:
+                    if key in self.plot_selected_cols:
+                        self.plot_selected_cols.remove(key)
+                    else:
+                        self.plot_selected_cols.add(key)
+                return
+
     def _set_logger_rate(self, label: str) -> None:
         mapping = {"120 Hz": 1.0 / 120.0, "60 Hz": 1.0 / 60.0, "30 Hz": 1.0 / 30.0, "10 Hz": 0.1}
         self.logger_interval = mapping.get(label, 1.0 / 30.0)
@@ -1268,7 +1383,10 @@ class RunnerApp:
         self._logger_elapsed = 0.0
         self._logger_timer = 0.0
         self.logger_status = "Logging…" if self.logger_enabled else "Logger paused"
-        self.btn_logger_toggle.set_text("Stop logging" if self.logger_enabled else "Start logging")
+        try:
+            self.btn_logger_toggle.set_text("Stop logging" if self.logger_enabled else "Start logging")
+        except Exception:
+            pass
 
     def _export_logger(self) -> None:
         if not self.scenario_name or not self.logger_samples:
@@ -1290,24 +1408,6 @@ class RunnerApp:
             self.status_text = f"Exported {len(self.logger_samples)} samples to {fname.name}"
         except Exception:
             self.status_text = "Failed to export log"
-
-    def _reset_pose(self) -> None:
-        if not self.sim:
-            return
-        self.sim.reset_to_spawn()
-        self.playing = False
-        self.btn_play.set_text("Play")
-        self.status_text = "Reset to spawn pose"
-
-    def _save_spawn_pose(self) -> None:
-        if not self.sim:
-            return
-        spawn = self._spawn_from_body()
-        if not spawn:
-            self.status_text = "Unable to infer spawn pose"
-            return
-        self.sim.reposition_robot(spawn, zero_velocity=True, set_as_spawn=True)
-        self.status_text = "Saved current pose as spawn"
 
     def _save_code(self) -> None:
         if not self.scenario_name:
@@ -1361,62 +1461,333 @@ class RunnerApp:
     def _load_snapshot(self) -> None:
         if not self.scenario_name or not self.sim:
             return
-        snap_dir = self.scenario_root / self.scenario_name / "snapshots"
-        snaps = sorted(snap_dir.glob("snap_*.json")) if snap_dir.exists() else []
+        snaps = self._list_snapshots(limit=1)
         if not snaps:
             print("No snapshots found")
             return
-        snap = load_snapshot(snaps[-1])
+        snap_path = snaps[-1]
+        snap = load_snapshot(snap_path)
         self.sim.apply_snapshot(snap)
-        print(f"Loaded snapshot {snaps[-1].name}")
+        print(f"Loaded snapshot {snap_path.name}")
+
+    def _save_snapshot_to_path(self, path: Path) -> None:
+        if not self.sim or not self.scenario_name:
+            return
+        path = path.with_suffix(".json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        save_snapshot(path, self.sim.snapshot())
+        print(f"Saved snapshot {path}")
+
+    def _load_snapshot_from_path(self, path: Path) -> None:
+        if not self.sim:
+            return
+        if not path.exists():
+            print(f"Snapshot not found: {path}")
+            return
+        snap = load_snapshot(path)
+        self.sim.apply_snapshot(snap)
+        print(f"Loaded snapshot {path.name}")
+
+    def _open_plot_dialog(self) -> None:
+        if not self.scenario_name:
+            return
+        log_dir = self.scenario_root / self.scenario_name / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        rect = pygame.Rect(
+            max(40, self.window_size[0] // 2 - 220),
+            max(40, self.window_size[1] // 2 - 160),
+            440,
+            320,
+        )
+        if self.plot_dialog:
+            try:
+                self.plot_dialog.kill()
+            except Exception:
+                pass
+        self.plot_dialog = UIFileDialog(
+            rect=rect,
+            manager=self.manager,
+            window_title="Open CSV log",
+            initial_file_path=str(log_dir),
+            allow_existing_files_only=True,
+        )
+
+    def _clear_plot_data(self) -> None:
+        self.plot_data = {}
+        self.plot_selected_cols.clear()
+        self.plot_source = None
+        self.plot_status = "No CSV loaded"
+        self.plot_hitboxes = {}
+
+    def _load_plot_from_path(self, path: Path) -> None:
+        if not path.exists():
+            self.plot_status = f"File not found: {path.name}"
+            return
+        try:
+            with path.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                if not reader.fieldnames:
+                    self.plot_status = "No columns found in CSV"
+                    self.plot_data = {}
+                    return
+                data: Dict[str, List[Optional[float]]] = {col: [] for col in reader.fieldnames}
+                for row in reader:
+                    for col in reader.fieldnames:
+                        raw = row.get(col, "")
+                        try:
+                            data[col].append(float(raw))
+                        except Exception:
+                            data[col].append(None)
+                self.plot_data = data
+                numeric_cols = [c for c, vals in data.items() if any(v is not None for v in vals)]
+                defaults = [c for c in numeric_cols if c != "t"][:2] or numeric_cols[:2]
+                self.plot_selected_cols = set(defaults)
+                self.plot_source = path
+                self.plot_status = f"Loaded {path.name} ({len(next(iter(data.values()), []))} rows)"
+                plot_panel = self.dock_items.get("plot")
+                if plot_panel:
+                    plot_panel.visible = True
+                    self._bump_panel("plot")
+                    self._update_layout()
+        except Exception:
+            self.plot_status = "Failed to parse CSV"
+            self.plot_data = {}
+            self.plot_selected_cols.clear()
+
+    def _list_snapshots(self, limit: int = 6) -> List[Path]:
+        if not self.scenario_name:
+            return []
+        snap_dir = self.scenario_root / self.scenario_name / "snapshots"
+        if not snap_dir.exists():
+            return []
+        snaps = sorted(snap_dir.glob("*.json"))
+        if limit > 0:
+            return snaps[-limit:]
+        return snaps
+
+    def _open_snapshot_dialog(self, mode: str) -> None:
+        if not self.scenario_name:
+            return
+        snaps_dir = self.scenario_root / self.scenario_name / "snapshots"
+        snaps_dir.mkdir(parents=True, exist_ok=True)
+        if self.snapshot_dialog:
+            try:
+                self.snapshot_dialog.kill()
+            except Exception:
+                pass
+        rect = pygame.Rect(
+            max(40, self.window_size[0] // 2 - 220),
+            max(40, self.window_size[1] // 2 - 160),
+            440,
+            320,
+        )
+        initial = snaps_dir if mode == "load" else snaps_dir / "snapshot.json"
+        self.snapshot_dialog = UIFileDialog(
+            rect=rect,
+            manager=self.manager,
+            window_title="Save snapshot" if mode == "save" else "Load snapshot",
+            initial_file_path=str(initial),
+            allow_existing_files_only=mode == "load",
+        )
+        self.snapshot_dialog_mode = mode
+
+    def _open_robot_dialog(self) -> None:
+        if not self.scenario_name or not self.world_cfg:
+            self.status_text = "Load a scenario before replacing robot"
+            return
+        base = (self.base_path / "assets" / "robots") if (self.base_path / "assets" / "robots").exists() else self.scenario_root
+        if self.robot_dialog:
+            try:
+                self.robot_dialog.kill()
+            except Exception:
+                pass
+        rect = pygame.Rect(
+            max(40, self.window_size[0] // 2 - 220),
+            max(40, self.window_size[1] // 2 - 160),
+            440,
+            320,
+        )
+        self.robot_dialog = UIFileDialog(
+            rect=rect,
+            manager=self.manager,
+            window_title="Replace robot from file",
+            initial_file_path=str(base),
+            allow_existing_files_only=True,
+        )
+
+    def _load_robot_from_path(self, path: Path) -> None:
+        if not path.exists():
+            self.status_text = f"Robot file not found: {path}"
+            return
+        try:
+            self.robot_cfg = load_robot_design(path)
+            self._reload_with_current_assets()
+            self.status_text = f"Loaded robot from {path.name}"
+        except Exception:
+            self._record_error("Robot load failed", traceback.format_exc())
+
+    def _toggle_device_help(self) -> None:
+        self.show_device_help = not self.show_device_help
+        self.status_text = "Device tips on" if self.show_device_help else "Device tips off"
+        self._refresh_hover_menu()
+
+    def _current_controller_module(self) -> Optional[str]:
+        if self.sim and self.sim.robot_cfg:
+            return getattr(self.sim.robot_cfg, "controller_module", None)
+        return None
+
+    def _controller_choices(self) -> List[str]:
+        if not self.scenario_name:
+            return []
+        scenario_path = self.scenario_root / self.scenario_name
+        if not scenario_path.exists():
+            return []
+        names = sorted({p.stem for p in scenario_path.glob("controller*.py")})
+        return names or ["controller"]
+
+    def _switch_controller(self, module_name: str) -> None:
+        if not self.sim or not self.scenario_name:
+            return
+        scenario_path = self.scenario_root / self.scenario_name
+        self.sim.robot_cfg.controller_module = module_name  # type: ignore[attr-defined]
+        if self.robot_cfg:
+            self.robot_cfg.controller_module = module_name
+        self.sim._load_controller(module_name, scenario_path, keep_previous=False)  # type: ignore[attr-defined]
+        if self.sim.last_controller_error:
+            self._record_error("Controller load failed", self.sim.last_controller_error)
+            self.sim.clear_controller_error()
+        else:
+            controller_file = scenario_path / f"{module_name}.py"
+            if controller_file.exists():
+                self.editor.set_text(controller_file.read_text(encoding="utf-8"))
+            self.status_text = f"Loaded controller {module_name}.py"
+            try:
+                if self.world_cfg and self.robot_cfg:
+                    save_scenario(scenario_path, self.world_cfg, self.robot_cfg)
+            except Exception:
+                pass
+        self._refresh_hover_menu()
 
     def _refresh_hover_menu(self) -> None:
         font = pygame.font.Font(pygame.font.get_default_font(), 14)
+
         def panel_toggle(pid: str, title: str) -> Dict[str, object]:
             return {
                 "label": title,
                 "action": lambda pid=pid: self._toggle_panel(pid),
                 "checked": lambda pid=pid: self.dock_items.get(pid, None) and self.dock_items[pid].visible,
             }
+
         def scenario_entry(name: str) -> Dict[str, object]:
             return {"label": name, "action": lambda n=name: self._select_scenario(n)}
+
+        def controller_entry(name: str) -> Dict[str, object]:
+            return {
+                "label": f"Use {name}.py",
+                "action": lambda n=name: self._switch_controller(n),
+                "checked": lambda n=name: self._current_controller_module() == n,
+            }
+
+        controller_items = [controller_entry(n) for n in self._controller_choices()] or [
+            {"label": "No controllers found", "action": lambda: None}
+        ]
+
+        snapshot_entries: List[Dict[str, object]] = [
+            {"label": "Quick snapshot", "action": self._save_snapshot},
+            {"label": "Save snapshot as...", "action": lambda: self._open_snapshot_dialog("save")},
+        ]
+        snapshots = self._list_snapshots(limit=6)
+        recent_snapshot_entries: List[Dict[str, object]] = []
+        if snapshots:
+            latest = snapshots[-1]
+            recent_snapshot_entries.append(
+                {"label": f"Latest ({latest.name})", "action": lambda p=latest: self._load_snapshot_from_path(p)}
+            )
+            for snap in reversed(snapshots):
+                recent_snapshot_entries.append({"label": snap.name, "action": lambda p=snap: self._load_snapshot_from_path(p)})
+        else:
+            recent_snapshot_entries.append({"label": "No recent snapshots", "action": lambda: None})
+
+        logger_entries = [
+            {"label": "Start/Stop logging", "action": self._toggle_logging},
+            {"label": "Export log", "action": self._export_logger},
+            {"label": "Open CSV plotter", "action": self._open_plot_dialog},
+            {
+                "label": "Show plot panel",
+                "action": lambda: self._toggle_panel("plot"),
+                "checked": lambda: self._panel_visible("plot"),
+            },
+            {"label": "Clear plot", "action": self._clear_plot_data},
+            {"label": "Logger rate 120 Hz", "action": lambda: self._set_logger_rate("120 Hz"), "checked": lambda: self.dropdown_logger_rate.selected_option == "120 Hz"},
+            {"label": "Logger rate 60 Hz", "action": lambda: self._set_logger_rate("60 Hz"), "checked": lambda: self.dropdown_logger_rate.selected_option == "60 Hz"},
+            {"label": "Logger rate 30 Hz", "action": lambda: self._set_logger_rate("30 Hz"), "checked": lambda: self.dropdown_logger_rate.selected_option == "30 Hz"},
+            {"label": "Logger rate 10 Hz", "action": lambda: self._set_logger_rate("10 Hz"), "checked": lambda: self.dropdown_logger_rate.selected_option == "10 Hz"},
+            {"label": "Logger duration 5 s", "action": lambda: self._set_logger_duration("5 s"), "checked": lambda: self.dropdown_logger_duration.selected_option == "5 s"},
+            {"label": "Logger duration 15 s", "action": lambda: self._set_logger_duration("15 s"), "checked": lambda: self.dropdown_logger_duration.selected_option == "15 s"},
+            {"label": "Logger duration 60 s", "action": lambda: self._set_logger_duration("60 s"), "checked": lambda: self.dropdown_logger_duration.selected_option == "60 s"},
+            {"label": "Logger duration Unlimited", "action": lambda: self._set_logger_duration("Unlimited"), "checked": lambda: self.dropdown_logger_duration.selected_option == "Unlimited"},
+        ]
+
+        speed_presets = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0]
+        speed_entries: List[Dict[str, object]] = [
+            {
+                "label": f"{val}x",
+                "action": (lambda v=val: self._set_playback_rate(v)),
+                "checked": (lambda v=val: math.isclose(self.playback_rate, v, rel_tol=1e-3)),
+            }
+            for val in speed_presets
+        ]
+        speed_entries.append({"label": "Open speed slider", "action": self._open_speed_slider})
+
+        capture_menu = [
+            {"label": "Snapshots", "children": snapshot_entries},
+            {"label": "Logging", "children": logger_entries},
+        ]
+
+        resume_entries: List[Dict[str, object]] = [{"label": "Load snapshot from file", "action": lambda: self._open_snapshot_dialog("load")}]
+        resume_entries.extend(recent_snapshot_entries)
+
         self.hover_menu = HoverMenu(
             [
-                ("Scenario", [{"label": "Reload", "action": self._load_sim}] + [scenario_entry(n) for n in self.scenario_names]),
+                (
+                    "Scenario",
+                    [{"label": "Reload", "action": self._load_sim}, {"label": "Replace robot from file", "action": self._open_robot_dialog}]
+                    + [scenario_entry(n) for n in self.scenario_names],
+                ),
                 (
                     "Run",
                     [
                         {"label": "Play" if not self.playing else "Pause", "action": self._toggle_play},
                         {"label": "Step", "action": self._step_once},
+                        {"label": f"Speed {self.playback_rate:.2f}x", "children": speed_entries},
+                        {"label": "Resume from snapshot", "children": resume_entries},
                     ],
                 ),
                 (
-                    "Code",
+                    "Controller",
                     [
-                        {"label": "Reload code", "action": self._reload_code},
-                        {"label": "Save code", "action": self._save_code},
-                        {"label": "Format code", "action": self._format_code},
+                        {"label": "Reload controller.py", "action": self._reload_code},
+                        {"label": "Save + reload controller", "action": self._save_code},
+                        {"label": "Format controller (black/autopep8)", "action": self._format_code},
+                        {"label": "Switch controller module", "action": lambda: None},
+                        *controller_items,
                     ],
                 ),
-                (
-                    "Snapshots",
-                    [
-                        {"label": "Save snapshot", "action": self._save_snapshot},
-                        {"label": "Load snapshot", "action": self._load_snapshot},
-                    ],
-                ),
+                ("Capture", capture_menu),
                 (
                     "View",
                     [
-                        {"label": "Reset view", "action": self._view_reset},
-                        {"label": "Center robot", "action": self._view_center_robot},
                         {"label": "Toggle grid", "action": self._view_toggle_grid, "checked": lambda: self.view_options.get("grid", False)},
                         {
                             "label": "Toggle motor arrows",
                             "action": self._view_toggle_motor_arrows,
                             "checked": lambda: self.view_options.get("motor_arrows", True),
                         },
-                        {"label": "Reposition robot", "action": self._view_reposition},
+                        {
+                            "label": "Toggle path trace",
+                            "action": self._view_toggle_path_trace,
+                            "checked": lambda: self.view_options.get("path_trace", False),
+                        },
                     ],
                 ),
                 (
@@ -1430,16 +1801,76 @@ class RunnerApp:
                     ],
                 ),
                 (
-                    "Logging",
+                    "Help",
                     [
-                        {"label": "Start/Stop logging", "action": self._toggle_logging},
-                        {"label": "Export log", "action": self._export_logger},
+                        {"label": "Open help overlay" if not self.help_open else "Close help overlay", "action": self._toggle_help_overlay},
+                        {
+                            "label": "Device tips",
+                            "action": self._toggle_device_help,
+                            "checked": lambda: self.show_device_help,
+                        },
+                        {"label": "Quick start", "action": lambda: self._open_help_topic("quickstart")},
+                        {"label": "Controllers", "action": lambda: self._open_help_topic("controllers")},
+                        {"label": "Required functions", "action": lambda: self._open_help_topic("required-fns")},
+                        {"label": "Sensors & motors", "action": lambda: self._open_help_topic("sensors-motors")},
+                        {"label": "Simulation loop", "action": lambda: self._open_help_topic("simulation")},
+                        {"label": "Logging & snapshots", "action": lambda: self._open_help_topic("logging-snapshots")},
                     ],
                 ),
             ],
             pos=(20, 8),
             font=font,
         )
+
+    def _draw_help_overlay(self) -> None:
+        if not self.help_open or not self.help_topics:
+            return
+        w, h = self.window_size
+        outer = pygame.Rect(40, 40, max(400, w - 80), max(320, h - 80))
+        nav_w = 220
+        padding = 12
+        font_title = pygame.font.Font(pygame.font.get_default_font(), 18)
+        font_nav = pygame.font.Font(pygame.font.get_default_font(), 15)
+        font_body = pygame.font.Font(pygame.font.get_default_font(), 14)
+        pygame.draw.rect(self.window_surface, (18, 20, 26), outer)
+        pygame.draw.rect(self.window_surface, (90, 110, 140), outer, 2)
+        nav_rect = pygame.Rect(outer.x + padding, outer.y + padding + 34, nav_w - padding * 2, outer.height - padding * 2 - 42)
+        content_rect = pygame.Rect(nav_rect.right + padding, outer.y + padding + 34, outer.width - nav_w - padding * 3, outer.height - padding * 2 - 42)
+        self.help_content_rect = content_rect
+        title = font_title.render("Runner help", True, (220, 230, 240))
+        self.window_surface.blit(title, (outer.x + padding, outer.y + padding))
+        self.help_close_rect = pygame.Rect(outer.right - 26, outer.y + 10, 16, 16)
+        pygame.draw.rect(self.window_surface, (90, 70, 70), self.help_close_rect)
+        pygame.draw.rect(self.window_surface, (180, 130, 130), self.help_close_rect, 1)
+        self.window_surface.blit(font_nav.render("×", True, (240, 210, 210)), (self.help_close_rect.x + 2, self.help_close_rect.y - 1))
+        # Nav list
+        self.help_nav_hitboxes = {}
+        nav_y = nav_rect.y
+        for topic in self.help_topics:
+            rect = pygame.Rect(nav_rect.x, nav_y, nav_rect.width, 26)
+            active = topic["id"] == self.help_active_topic
+            pygame.draw.rect(self.window_surface, (36, 40, 48) if active else (26, 28, 32), rect)
+            pygame.draw.rect(self.window_surface, (90, 110, 140), rect, 1)
+            self.window_surface.blit(font_nav.render(str(topic["title"]), True, (210, 220, 230)), (rect.x + 6, rect.y + 4))
+            self.help_nav_hitboxes[topic["id"]] = pygame.Rect(rect)
+            nav_y += 28
+        # Content
+        topic = next((t for t in self.help_topics if t["id"] == self.help_active_topic), self.help_topics[0])
+        lines: List[str] = []
+        for line in topic.get("lines", []):
+            lines.extend(self._wrap_text(str(line), font_body, content_rect.width - 12))
+        content_height = len(lines) * 20 + 10
+        self.help_last_content_height = content_height
+        self._clamp_help_scroll(content_height, content_rect.height)
+        pygame.draw.rect(self.window_surface, (26, 28, 32), content_rect)
+        pygame.draw.rect(self.window_surface, (90, 110, 140), content_rect, 1)
+        y = content_rect.y + 8 + self.help_scroll
+        for line in lines:
+            self.window_surface.blit(font_body.render(line, True, (210, 220, 230)), (content_rect.x + 8, y))
+            y += 20
+        # Footer
+        footer = font_body.render("Topics snapshotted for deterministic help", True, (150, 170, 190))
+        self.window_surface.blit(footer, (outer.x + padding, outer.bottom - padding - 16))
     def _draw(self) -> None:
         self.window_surface.fill((18, 18, 18))
         pygame.draw.rect(self.window_surface, (10, 10, 10), self.viewport_rect)
@@ -1448,6 +1879,8 @@ class RunnerApp:
             self.window_surface.set_clip(self.viewport_rect)
             if self.view_options.get("grid", False):
                 self._draw_grid()
+            if self.world_cfg:
+                self._draw_environment_overlays()
             self._draw_world()
             self.window_surface.set_clip(None)
         if self.error_log:
@@ -1476,38 +1909,30 @@ class RunnerApp:
         self.window_surface.blit(status_surf, (20, self.window_size[1] - 44))
         hint_surf = font.render(self.status_text, True, (190, 210, 230))
         self.window_surface.blit(hint_surf, (20, self.window_size[1] - 24))
-        # Device help overlay near devices panel
-        devices_inner = self.panel_inner_rects.get("devices")
-        if self.device_help_lines and self._panel_visible("devices") and self.show_device_help and devices_inner:
-            box_h = 18 * len(self.device_help_lines) + 8
-            rect = pygame.Rect(devices_inner.x, max(50, devices_inner.y - box_h - 8), devices_inner.width, box_h)
-            pygame.draw.rect(self.window_surface, (18, 22, 26), rect)
-            pygame.draw.rect(self.window_surface, (70, 90, 110), rect, 1)
-            for i, line in enumerate(self.device_help_lines):
-                txt = font.render(line, True, (210, 220, 230))
-                self.window_surface.blit(txt, (rect.x + 6, rect.y + 4 + i * 18))
+        self._draw_help_overlay()
         pygame.display.update()
 
     def _render_panel(self, item: DockItem) -> None:
         rect = item.rect
         header_rect = self._panel_header_rect(item)
         inner_rect = self.panel_inner_rects.get(item.id, self._panel_inner_rect(item))
-        pygame.draw.rect(self.window_surface, (24, 28, 32), rect)
-        pygame.draw.rect(self.window_surface, (90, 110, 130), rect, 1)
-        pygame.draw.rect(self.window_surface, (34, 38, 44), header_rect)
-        pygame.draw.rect(self.window_surface, (110, 130, 150), header_rect, 1)
+        panel_radius = 8
+        pygame.draw.rect(self.window_surface, (24, 28, 32), rect, border_radius=panel_radius)
+        pygame.draw.rect(self.window_surface, (90, 110, 130), rect, 1, border_radius=panel_radius)
+        pygame.draw.rect(self.window_surface, (36, 42, 50), header_rect, border_radius=panel_radius)
+        pygame.draw.rect(self.window_surface, (110, 130, 150), header_rect, 1, border_radius=panel_radius)
         font = pygame.font.Font(pygame.font.get_default_font(), 14)
         self.window_surface.blit(font.render(item.title, True, (210, 220, 230)), (header_rect.x + 8, header_rect.y + 5))
         dock_label = {"left": "L", "right": "R", "bottom": "B", "floating": "F"}.get(item.dock, "")
         if dock_label:
             self.window_surface.blit(font.render(dock_label, True, (160, 190, 210)), (header_rect.right - 60, header_rect.y + 5))
         close_rect = self._panel_close_rect(item)
-        pygame.draw.rect(self.window_surface, (70, 50, 50), close_rect)
-        pygame.draw.rect(self.window_surface, (140, 110, 110), close_rect, 1)
+        pygame.draw.rect(self.window_surface, (70, 50, 50), close_rect, border_radius=4)
+        pygame.draw.rect(self.window_surface, (140, 110, 110), close_rect, 1, border_radius=4)
         self.window_surface.blit(font.render("×", True, (240, 200, 200)), (close_rect.x + 5, close_rect.y + 2))
         for _, hrect in self._panel_resize_handles(item):
-            pygame.draw.rect(self.window_surface, (50, 60, 70), hrect)
-            pygame.draw.rect(self.window_surface, (120, 140, 160), hrect, 1)
+            pygame.draw.rect(self.window_surface, (50, 60, 70), hrect, border_radius=4)
+            pygame.draw.rect(self.window_surface, (120, 140, 160), hrect, 1, border_radius=4)
         if inner_rect.width > 0 and inner_rect.height > 0:
             self._draw_panel_content(item.id, inner_rect)
 
@@ -1523,6 +1948,8 @@ class RunnerApp:
             self._draw_logs_panel(inner_rect)
         elif panel_id == "console":
             self._draw_console_panel(inner_rect)
+        elif panel_id == "plot":
+            self._draw_plot_panel(inner_rect)
 
     def _draw_grid(self) -> None:
         min_x, min_y = screen_to_world(self.viewport_rect.bottomleft, self.viewport_rect, self.scale, self.offset)
@@ -1549,66 +1976,89 @@ class RunnerApp:
             pygame.draw.line(self.window_surface, color, p1, p2, 1)
 
     def _draw_devices_panel(self, rect: pygame.Rect) -> None:
-        pygame.draw.rect(self.window_surface, (22, 26, 30), rect)
-        pygame.draw.rect(self.window_surface, (70, 90, 120), rect, 1)
-        font = pygame.font.Font(pygame.font.get_default_font(), 16)
-        small = pygame.font.Font(pygame.font.get_default_font(), 14)
-        mono = pygame.font.SysFont("Menlo", 14) or small
-        self.window_surface.blit(font.render("Devices & controller hints", True, (190, 210, 230)), (rect.x + 8, rect.y + 6))
-        y = rect.y + 36
-        motors = ", ".join(self.sim.motors.keys()) if self.sim else "none"
-        sensors = ", ".join(self.sim.sensors.keys()) if self.sim else "none"
-        self.window_surface.blit(small.render(f"Motors: {motors or 'none'}", True, (200, 210, 220)), (rect.x + 8, y))
-        y += 18
-        self.window_surface.blit(small.render(f"Sensors: {sensors or 'none'}", True, (200, 210, 220)), (rect.x + 8, y))
-        y += 26
-        self.window_surface.blit(small.render("Control basics (examples):", True, (170, 200, 220)), (rect.x + 8, y))
-        y += 18
+        pygame.draw.rect(self.window_surface, (24, 28, 32), rect, border_radius=8)
+        pygame.draw.rect(self.window_surface, (90, 110, 140), rect, 1, border_radius=8)
+        header = pygame.font.SysFont(pygame.font.get_default_font(), 18, bold=True)
+        section = pygame.font.SysFont(pygame.font.get_default_font(), 15, bold=True)
+        body = pygame.font.Font(pygame.font.get_default_font(), 14)
+        mono = pygame.font.SysFont("Menlo", 14) or body
+
+        self.window_surface.blit(header.render("Available devices", True, (200, 220, 240)), (rect.x + 10, rect.y + 8))
+        y = rect.y + 38
+
+        motors_list: List[str] = []
+        sensors_list: List[str] = []
+        if self.sim:
+            for name, motor in self.sim.motors.items():
+                tag = getattr(motor, "visual_tag", "") or motor.__class__.__name__
+                motors_list.append(f"{name} ({tag})" if tag else name)
+            for name, sensor in self.sim.sensors.items():
+                stype = getattr(sensor, "visual_tag", "") or sensor.__class__.__name__
+                sensors_list.append(f"{name} ({stype})" if stype else name)
+
+        def draw_list(title: str, items: List[str]) -> None:
+            nonlocal y
+            self.window_surface.blit(section.render(title, True, (190, 205, 230)), (rect.x + 10, y))
+            y += 22
+            if not items:
+                self.window_surface.blit(body.render("• none detected", True, (180, 185, 190)), (rect.x + 18, y))
+                y += 20
+                return
+            for idx, item in enumerate(items, 1):
+                text = f"{idx}. {item}"
+                self.window_surface.blit(body.render(text, True, (210, 215, 225)), (rect.x + 16, y))
+                y += 18
+            y += 10
+
+        draw_list("Motors", motors_list)
+        draw_list("Sensors", sensors_list)
+
+        if not self.show_device_help:
+            return
+
+        self.window_surface.blit(section.render("Controller hints", True, (190, 205, 230)), (rect.x + 10, y))
+        y += 22
         examples = [
-            "Command motor:  sim.motors['left'].command(0.5, sim, dt)",
-            "Read sensor:    value = sensors['front']",
-            "Encoder ticks:  sensors['enc'].value",
+            "Command: sim.motors['left'].command(0.5, sim, dt)",
+            "Read:    sensors['front']",
+            "Encoders: sensors['enc'].value",
         ]
         for line in examples:
-            self.window_surface.blit(mono.render(line, True, (200, 220, 230)), (rect.x + 10, y))
+            self.window_surface.blit(mono.render(line, True, (205, 220, 235)), (rect.x + 16, y))
             y += 18
-        y += 10
-        self.window_surface.blit(small.render("Tips:", True, (170, 200, 220)), (rect.x + 8, y))
-        y += 18
+        y += 6
         tips = [
-            "Use the State tab to watch signals and log them.",
-            "Toggle grid/view options from the dropdown in the viewport.",
-            "Hide/show this help with the button above.",
+            "Use State to watch + log signals.",
+            "Hover menu holds view and snapshot toggles.",
         ]
         for line in tips:
-            self.window_surface.blit(small.render(line, True, (200, 210, 220)), (rect.x + 10, y))
+            self.window_surface.blit(body.render(f"• {line}", True, (190, 205, 215)), (rect.x + 16, y))
             y += 18
-        if not self.show_device_help:
-            warning = small.render("Help hidden (toggle to show).", True, (200, 180, 160))
-            self.window_surface.blit(warning, (rect.x + 8, rect.bottom - 26))
 
     def _draw_state_panel(self, rect: pygame.Rect) -> None:
-        pygame.draw.rect(self.window_surface, (22, 24, 28), rect)
-        pygame.draw.rect(self.window_surface, (70, 90, 120), rect, 1)
+        pygame.draw.rect(self.window_surface, (22, 24, 28), rect, border_radius=8)
+        pygame.draw.rect(self.window_surface, (70, 90, 120), rect, 1, border_radius=8)
         font = pygame.font.Font(pygame.font.get_default_font(), 16)
         small = pygame.font.Font(pygame.font.get_default_font(), 14)
         self.signal_hitboxes = {}
         self.window_surface.blit(font.render("Live state + logger", True, (190, 210, 230)), (rect.x + 8, rect.y + 6))
-        control_rows = 4 * 34 + 16
+        control_rows = 2 * 28
         y = rect.y + control_rows
         logger_line = f"{self.logger_status} | samples: {len(self.logger_samples)} | rate: {1.0/self.logger_interval:.1f} Hz"
         self.window_surface.blit(small.render(logger_line, True, (200, 210, 220)), (rect.x + 8, y))
+        y += 20
+        self.window_surface.blit(small.render("Use Capture menu to start/stop and export logs.", True, (170, 190, 210)), (rect.x + 8, y))
         y += 20
         self.window_surface.blit(small.render("Live signals:", True, (180, 200, 220)), (rect.x + 8, y))
         y += 18
         motors = self.live_state.get("motors", {})
         sensors = self.live_state.get("sensors", {})
         for name, val in motors.items():
-            line = f"motor {name}: {val:.2f}"
+            line = f"motor {name}: {self._fmt_value(val)}"
             self.window_surface.blit(small.render(line, True, (180, 220, 180)), (rect.x + 16, y))
             y += 16
         for name, val in sensors.items():
-            line = f"sensor {name}: {val}"
+            line = f"sensor {name}: {self._fmt_value(val)}"
             self.window_surface.blit(small.render(line, True, (200, 200, 180)), (rect.x + 16, y))
             y += 16
         y = max(y + 10, rect.y + 140)
@@ -1638,6 +2088,7 @@ class RunnerApp:
             ("devices", "Devices"),
             ("state", "State"),
             ("logs", "Logs"),
+            ("plot", "CSV Plot"),
         ]
 
     def _handle_panel_menu_event(self, event: pygame.event.Event) -> bool:
@@ -1697,8 +2148,8 @@ class RunnerApp:
         font = pygame.font.Font(pygame.font.get_default_font(), 15)
         has_error = bool(self.error_log)
         bg = (30, 22, 22) if has_error else (22, 26, 22)
-        pygame.draw.rect(self.window_surface, bg, rect)
-        pygame.draw.rect(self.window_surface, (90, 70, 70) if has_error else (70, 90, 70), rect, 1)
+        pygame.draw.rect(self.window_surface, bg, rect, border_radius=8)
+        pygame.draw.rect(self.window_surface, (90, 70, 70) if has_error else (70, 90, 70), rect, 1, border_radius=8)
         header = f"Errors ({len(self.error_log)})"
         self.window_surface.blit(
             font.render(header, True, (240, 140, 140) if has_error else (160, 190, 160)),
@@ -1730,8 +2181,8 @@ class RunnerApp:
         content_font = pygame.font.Font(pygame.font.get_default_font(), 14)
         font = pygame.font.Font(pygame.font.get_default_font(), 15)
         bg = (22, 26, 30)
-        pygame.draw.rect(self.window_surface, bg, rect)
-        pygame.draw.rect(self.window_surface, (70, 90, 120), rect, 1)
+        pygame.draw.rect(self.window_surface, bg, rect, border_radius=8)
+        pygame.draw.rect(self.window_surface, (70, 90, 120), rect, 1, border_radius=8)
         header = "Console output"
         self.window_surface.blit(font.render(header, True, (180, 210, 240)), (rect.x + 8, rect.y + 6))
         y = rect.y + 28
@@ -1750,6 +2201,143 @@ class RunnerApp:
                 self.window_surface.blit(content_font.render(w, True, (210, 220, 230)), (rect.x + 8, y))
                 y += 18
 
+    def _draw_plot_panel(self, rect: pygame.Rect) -> None:
+        font = pygame.font.Font(pygame.font.get_default_font(), 15)
+        small = pygame.font.Font(pygame.font.get_default_font(), 13)
+        bg = (22, 26, 30)
+        pygame.draw.rect(self.window_surface, bg, rect, border_radius=8)
+        pygame.draw.rect(self.window_surface, (70, 90, 120), rect, 1, border_radius=8)
+        self.window_surface.blit(font.render("CSV plotter", True, (190, 210, 240)), (rect.x + 8, rect.y + 6))
+        self.plot_hitboxes = {}
+        open_rect = pygame.Rect(rect.x + 8, rect.y + 32, 120, 24)
+        pygame.draw.rect(self.window_surface, (40, 60, 80), open_rect, border_radius=4)
+        pygame.draw.rect(self.window_surface, (110, 140, 170), open_rect, 1, border_radius=4)
+        self.window_surface.blit(small.render("Load CSV…", True, (210, 220, 230)), (open_rect.x + 8, open_rect.y + 4))
+        self.plot_hitboxes["__open__"] = open_rect
+        clear_rect = pygame.Rect(open_rect.right + 8, open_rect.y, 90, 24)
+        pygame.draw.rect(self.window_surface, (50, 50, 60), clear_rect, border_radius=4)
+        pygame.draw.rect(self.window_surface, (110, 110, 130), clear_rect, 1, border_radius=4)
+        self.window_surface.blit(small.render("Clear", True, (210, 210, 220)), (clear_rect.x + 8, clear_rect.y + 4))
+        self.plot_hitboxes["__clear__"] = clear_rect
+        info_y = clear_rect.bottom + 6
+        source_label = f"Source: {self.plot_source.name}" if self.plot_source else "Source: —"
+        self.window_surface.blit(small.render(source_label, True, (190, 200, 210)), (rect.x + 8, info_y))
+        info_y += 18
+        self.window_surface.blit(small.render(self.plot_status, True, (170, 200, 220)), (rect.x + 8, info_y))
+        toggle_x = rect.x + 8
+        toggle_y = info_y + 18
+        columns = [c for c in self.plot_data.keys() if c]
+        if "t" in columns:
+            columns = [c for c in columns if c != "t"] + ["t"]
+        for col in columns:
+            box = pygame.Rect(toggle_x, toggle_y, 14, 14)
+            pygame.draw.rect(self.window_surface, (60, 70, 80), box, 1)
+            if col in self.plot_selected_cols:
+                pygame.draw.rect(self.window_surface, (90, 170, 120), box.inflate(-4, -4))
+            label = small.render(col, True, (210, 220, 230))
+            self.window_surface.blit(label, (box.right + 6, box.y - 2))
+            self.plot_hitboxes[col] = pygame.Rect(box)
+            toggle_y += 18
+            if toggle_y > rect.bottom - 40:
+                toggle_y = info_y + 18
+                toggle_x += 140
+        plot_rect = pygame.Rect(rect.x + 8 + 140, rect.y + 60, rect.width - 156, rect.height - 70)
+        pygame.draw.rect(self.window_surface, (18, 20, 24), plot_rect, border_radius=4)
+        pygame.draw.rect(self.window_surface, (80, 90, 110), plot_rect, 1, border_radius=4)
+        if not self.plot_data or not self.plot_selected_cols:
+            msg = "Select a CSV file and choose columns."
+            self.window_surface.blit(small.render(msg, True, (180, 190, 200)), (plot_rect.x + 12, plot_rect.y + 12))
+            return
+        time_axis = self.plot_data.get("t")
+        if not time_axis:
+            any_series = next(iter(self.plot_data.values()), [])
+            time_axis = list(range(len(any_series)))
+        selected_cols = [c for c in self.plot_selected_cols if c in self.plot_data]
+        if not selected_cols:
+            return
+        max_len = min(len(time_axis), *(len(self.plot_data[c]) for c in selected_cols))
+        if max_len <= 1:
+            self.window_surface.blit(small.render("Not enough samples to plot.", True, (190, 180, 180)), (plot_rect.x + 12, plot_rect.y + 12))
+            return
+        xs = [float(time_axis[i]) for i in range(max_len) if time_axis[i] is not None]
+        x_min = min(xs) if xs else 0.0
+        x_max = max(xs) if xs else 1.0
+        if abs(x_max - x_min) < 1e-9:
+            x_max = x_min + 1.0
+        color_palette = [
+            (120, 200, 255),
+            (200, 160, 120),
+            (140, 220, 170),
+            (220, 140, 180),
+            (180, 180, 120),
+        ]
+        y_min = float("inf")
+        y_max = float("-inf")
+        for col in selected_cols:
+            series = self.plot_data[col]
+            for i in range(min(max_len, len(series))):
+                val = series[i]
+                if val is None:
+                    continue
+                y_min = min(y_min, val)
+                y_max = max(y_max, val)
+        if not math.isfinite(y_min) or not math.isfinite(y_max) or abs(y_max - y_min) < 1e-9:
+            y_min, y_max = -1.0, 1.0
+        padding = max(1e-3, (y_max - y_min) * 0.05)
+        y_min -= padding
+        y_max += padding
+
+        def to_screen(x_val: float, y_val: float) -> Tuple[int, int]:
+            x_norm = (x_val - x_min) / (x_max - x_min)
+            y_norm = (y_val - y_min) / (y_max - y_min)
+            sx = plot_rect.x + int(x_norm * (plot_rect.width - 6)) + 3
+            sy = plot_rect.bottom - int(y_norm * (plot_rect.height - 6)) - 3
+            return (sx, sy)
+
+        for idx, col in enumerate(selected_cols):
+            series = self.plot_data[col]
+            pts: List[Tuple[int, int]] = []
+            for i in range(min(max_len, len(series))):
+                y_val = series[i]
+                x_val = float(time_axis[i]) if i < len(time_axis) else float(i)
+                if y_val is None or not math.isfinite(y_val):
+                    if len(pts) > 1:
+                        pygame.draw.lines(self.window_surface, color_palette[idx % len(color_palette)], False, pts, 2)
+                    pts = []
+                    continue
+                pts.append(to_screen(x_val, float(y_val)))
+            if len(pts) > 1:
+                pygame.draw.lines(self.window_surface, color_palette[idx % len(color_palette)], False, pts, 2)
+            label = small.render(col, True, color_palette[idx % len(color_palette)])
+            self.window_surface.blit(label, (plot_rect.x + 10 + idx * 80, plot_rect.bottom - 22))
+
+    def _draw_environment_overlays(self) -> None:
+        if not self.world_cfg:
+            return
+        rot = getattr(self, "view_rotation", 0.0)
+        if getattr(self.world_cfg, "bounds", None):
+            b = self.world_cfg.bounds
+            assert b
+            corners = [
+                (b.min_x, b.min_y),
+                (b.min_x, b.max_y),
+                (b.max_x, b.max_y),
+                (b.max_x, b.min_y),
+            ]
+            pts = [world_to_screen(c, self.viewport_rect, self.scale, self.offset, rot) for c in corners]
+            pygame.draw.polygon(self.window_surface, (70, 90, 120), pts, max(1, int(0.02 * self.scale)))
+        strokes = getattr(self.world_cfg, "drawings", []) or []
+        for stroke in strokes:
+            if not getattr(stroke, "points", None) or len(stroke.points) < 2:
+                continue
+            color = tuple(getattr(stroke, "color", (140, 200, 255)))
+            pts = [world_to_screen(p, self.viewport_rect, self.scale, self.offset, rot) for p in stroke.points]
+            width = max(1, int(max(1.0, stroke.thickness * self.scale)))
+            pygame.draw.lines(self.window_surface, color, False, pts, width)
+            if getattr(stroke, "kind", "mark") != "wall":
+                continue
+            pygame.draw.lines(self.window_surface, (40, 50, 60), False, pts, 1)
+
     def _draw_world(self) -> None:
         assert self.sim
         for body in self.sim.bodies.values():
@@ -1759,7 +2347,13 @@ class RunnerApp:
                 pts = [world_to_screen(v, self.viewport_rect, self.scale, self.offset) for v in verts]
                 pygame.draw.polygon(self.window_surface, color, pts, 0)
                 pygame.draw.polygon(self.window_surface, (30, 30, 30), pts, 1)
-        if self.reposition_mode and self.reposition_target:
+        if self.view_options.get("path_trace", False) and self.path_trace:
+            pts = [world_to_screen(p, self.viewport_rect, self.scale, self.offset) for p in self.path_trace]
+            if len(pts) >= 2:
+                pygame.draw.lines(self.window_surface, (90, 160, 230), False, pts, 2)
+            else:
+                pygame.draw.circle(self.window_surface, (90, 160, 230), pts[0], 3)
+        if self.robot_dragging and self.reposition_target:
             px, py = self.reposition_target
             center = world_to_screen((px, py), self.viewport_rect, self.scale, self.offset)
             pygame.draw.circle(self.window_surface, (120, 160, 220), center, 8, 2)
@@ -1767,19 +2361,38 @@ class RunnerApp:
             pygame.draw.line(self.window_surface, (120, 160, 220), (center[0], center[1] - 8), (center[0], center[1] + 8), 1)
         # motor arrows
         if self.view_options.get("motor_arrows", True):
+            def draw_arrow_with_head(start: Tuple[int, int], end: Tuple[int, int], color: Tuple[int, int, int]) -> None:
+                pygame.draw.line(self.window_surface, color, start, end, 3)
+                vx = end[0] - start[0]
+                vy = end[1] - start[1]
+                length = math.hypot(vx, vy)
+                if length < 1e-3:
+                    return
+                nx, ny = vx / length, vy / length
+                perp = (-ny, nx)
+                head_len = 10
+                head_w = 5
+                tip = end
+                left = (end[0] - nx * head_len + perp[0] * head_w, end[1] - ny * head_len + perp[1] * head_w)
+                right = (end[0] - nx * head_len - perp[0] * head_w, end[1] - ny * head_len - perp[1] * head_w)
+                pygame.draw.polygon(self.window_surface, color, [tip, left, right])
             for motor in self.sim.motors.values():
                 parent = motor.parent
                 if not parent:
                     continue
                 pose = parent.pose.compose(motor.mount_pose)
-                start = world_to_screen((pose.x, pose.y), self.viewport_rect, self.scale, self.offset)
-                length = 0.05 + abs(motor.last_command) * 0.1
                 direction = (pygame.math.Vector2(1, 0).rotate_rad(pose.theta).x, pygame.math.Vector2(1, 0).rotate_rad(pose.theta).y)
-                end_world = (pose.x + direction[0] * length, pose.y + direction[1] * length)
+                sign = 1 if motor.last_command >= 0 else -1
+                length = 0.06 + abs(motor.last_command) * 0.09
+                start_world = (pose.x + direction[0] * 0.02 * sign, pose.y + direction[1] * 0.02 * sign)
+                end_world = (pose.x + direction[0] * (length + 0.02) * sign, pose.y + direction[1] * (length + 0.02) * sign)
+                start = world_to_screen(start_world, self.viewport_rect, self.scale, self.offset)
                 end = world_to_screen(end_world, self.viewport_rect, self.scale, self.offset)
                 color = (0, 200, 120) if motor.last_command >= 0 else (200, 80, 80)
-                pygame.draw.line(self.window_surface, color, start, end, 3)
-                pygame.draw.circle(self.window_surface, color, end, 4)
+                wheel_radius = max(3, int(self.scale * 0.01))
+                pygame.draw.circle(self.window_surface, (28, 34, 42), start, wheel_radius)
+                pygame.draw.circle(self.window_surface, color, start, wheel_radius, 2)
+                draw_arrow_with_head(start, end, color)
         # robot center hover indicator
         center = self._current_robot_center()
         if center:

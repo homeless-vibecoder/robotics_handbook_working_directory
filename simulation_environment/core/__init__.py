@@ -13,5 +13,16 @@ from .config import (  # noqa: F401
     save_json,
 )
 from .simulator import Simulator  # noqa: F401
-from .persistence import load_scenario, save_scenario, load_snapshot, save_snapshot  # noqa: F401
+from .persistence import (  # noqa: F401
+    load_scenario,
+    save_scenario,
+    load_snapshot,
+    save_snapshot,
+    save_robot_design,
+    load_robot_design,
+    save_environment_design,
+    load_environment_design,
+    save_custom_asset,
+    load_custom_asset,
+)
 

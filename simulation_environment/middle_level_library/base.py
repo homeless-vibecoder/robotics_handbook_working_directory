@@ -119,6 +119,8 @@ class Motor(MountedComponent):
         super().__init__(name, mount_pose)
         self.max_command = max_command
         self._last_command: float = 0.0
+        self.last_report = None
+        self._last_report_step: Optional[int] = None
 
     def command(self, value: float, world: World, dt: float) -> None:
         value = max(-self.max_command, min(self.max_command, value))

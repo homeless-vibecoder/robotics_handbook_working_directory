@@ -4,14 +4,20 @@ Quick-start
 - Install deps: `pip install pygame pygame_gui`.
 - Runner (for coding/playback): `python apps/runner.py`
   - Pick a scenario from the dropdown (looks in `scenarios/`).
-  - Play/Pause/Step, save/load snapshots, edit `controller.py` and hot-reload.
-- Designer (for geometry/devices): `python apps/designer.py`
-  - Pick a scenario, select a body, edit polygon points (add/move/delete), add motors/sensors, save back to JSON.
+  - Use the hover menu: Run > Play/Pause/Step, Run > Resume from snapshot, Capture > Snapshots/Logging (nested).
+  - Drag the robot directly in the viewport to reposition; no separate mode toggle.
+  - Edit `controller.py` in Code; Save + Reload to apply.
+- Designer (for geometry/devices/custom assets): `python apps/designer.py`
+  - Use the hover menu tabs (Robot / Environment / Custom); each tab is isolated with its own New/Open/Save/Save As.
+  - Robot tab: edit bodies/devices; Environment tab: draw marks/walls/bounds; Custom tab: craft custom shapes/assets.
+  - Shift+drag rotates the view; Cmd/Ctrl+Z / Shift+Cmd/Ctrl+Z undo/redo within the active tab.
+  - Export full scenarios only when you choose Export; otherwise robot/env/custom saves live under `designs/`.
 
-Controls (top bar)
-- Play/Pause, Step one tick.
-- Save snapshot (writes to `scenarios/generic/snapshots/`), Load snapshot (loads latest).
-- Reload code (reloads controller module), Save code (writes editor buffer then reloads).
+Controls (hover menu)
+- Run: Play/Pause, Step, Resume from snapshot (recent + load from file).
+- Capture: Snapshots (quick/save-as) and Logging (start/stop, export, plotter, rate/duration).
+- View: grid/motor arrows/path trace toggles; Panels: show/hide Code/State/Logs/Console/Plot.
+- Help: structured topics with summaries + deeper sections.
 
 Code editor
 - Right-side panel is a minimal text editor for `scenarios/generic/controller.py` (supports typing, backspace, newline, tab).
@@ -30,6 +36,7 @@ Data layout
 - `scenarios/<name>/robot.json` – bodies, sensors/motors, controller module name.
 - `scenarios/<name>/controller.py` – student code (hot-reloaded).
 - `scenarios/<name>/snapshots/` – saved states (include controller state).
+- `designs/robots|environments|custom/` – per-tab designer saves (isolated).
 
 Notes
 - Solver uses XPBD-style joint correction + impulse contacts with reasonable defaults (dt ~1/120s).

@@ -100,10 +100,14 @@ class ComponentVisualizer:
         command = float(state.get("command", 0.0))
         magnitude = min(1.0, max(0.0, abs(command)))
         direction = 1.0 if command >= 0.0 else -1.0
-        base_length = 0.12
-        arrow_length = base_length * (0.5 + 0.5 * magnitude)
-        start_world = (pose.x, pose.y)
-        end_world = pose.transform_point((arrow_length * direction, 0.0))
+        base_length = 0.1
+        arrow_length = base_length * (0.55 + 0.45 * magnitude)
+        rim_r = max(3, int(ctx.scale * 0.012))
+        hub_screen = ctx.world_to_screen((pose.x, pose.y))
+        pygame.draw.circle(ctx.surface, (28, 34, 42), hub_screen, rim_r)
+        pygame.draw.circle(ctx.surface, (90, 120, 150), hub_screen, rim_r, 2)
+        start_world = pose.transform_point((0.02 * direction, 0.0))
+        end_world = pose.transform_point(((arrow_length + 0.02) * direction, 0.0))
         start = ctx.world_to_screen(start_world)
         end = ctx.world_to_screen(end_world)
         color = (120, 255, 140) if command >= 0 else (255, 120, 120)
@@ -166,16 +170,13 @@ class ComponentVisualizer:
 
 
     def _draw_motor_icon(self, pose: Pose2D, color: Color, ctx: _DrawContext) -> None:
-        length = 0.05
-        half_width = 0.02
-        local = [
-            (-length, -half_width),
-            (-length, half_width),
-            (length, half_width),
-            (length, -half_width),
-        ]
-        points = [ctx.world_to_screen(pose.transform_point(pt)) for pt in local]
-        pygame.draw.polygon(ctx.surface, color, points)
+        radius = max(4, int(ctx.scale * 0.018))
+        center_world = (pose.x, pose.y)
+        center = ctx.world_to_screen(center_world)
+        pygame.draw.circle(ctx.surface, color, center, radius)
+        pygame.draw.circle(ctx.surface, (26, 26, 26), center, max(2, radius // 2), 2)
+        spoke_end = ctx.world_to_screen(pose.transform_point((0.05, 0.0)))
+        pygame.draw.line(ctx.surface, (18, 18, 18), center, spoke_end, 2)
 
     def _draw_sensor_icon(self, tag: str, pose: Pose2D, color: Color, ctx: _DrawContext) -> None:
         size = 0.025

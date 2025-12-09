@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import json
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 import copy
@@ -12,8 +13,29 @@ import pygame_gui
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from core import load_scenario, save_scenario  # noqa: E402
-from core.config import RobotConfig, WorldConfig, BodyConfig, ActuatorConfig, SensorConfig  # noqa: E402
+from core import (  # noqa: E402
+    load_scenario,
+    save_scenario,
+    save_robot_design,
+    load_robot_design,
+    save_environment_design,
+    load_environment_design,
+    save_custom_asset,
+    load_custom_asset,
+)  # noqa: E402
+from core.config import (  # noqa: E402
+    RobotConfig,
+    WorldConfig,
+    BodyConfig,
+    ActuatorConfig,
+    SensorConfig,
+    StrokeConfig,
+    EnvironmentBounds,
+    CustomObjectConfig,
+    DesignerState,
+    save_json,
+    load_json,
+)
 from core.simulator import Simulator  # noqa: E402
 from apps.shared_ui import list_scenarios, draw_polygon, world_to_screen, screen_to_world, HoverMenu  # noqa: E402
 from low_level_mechanics.geometry import Polygon  # noqa: E402
@@ -33,7 +55,7 @@ class DesignerApp:
         self.base_path = Path(__file__).resolve().parent.parent
         self.scenario_root = self.base_path / "scenarios"
         self.scenario_names = list_scenarios(self.scenario_root)
-        self.scenario_name = self.scenario_names[0] if self.scenario_names else None
+        self.scenario_name = None
         self.world_cfg: Optional[WorldConfig] = None
         self.robot_cfg: Optional[RobotConfig] = None
         self.sim: Optional[Simulator] = None
@@ -67,14 +89,46 @@ class DesignerApp:
         self.undo_stack: List[RobotConfig] = []
         self.redo_stack: List[RobotConfig] = []
         self.hover_menu: Optional[HoverMenu] = None
+        self.env_tool: str = "off"  # off | mark | wall
+        self.env_brush_thickness: float = 0.05
+        self.env_drawing: bool = False
+        self.env_stroke_points: List[Tuple[float, float]] = []
+        self.bounds_mode: bool = False
+        self.bounds_start: Optional[Tuple[float, float]] = None
+        self.bounds_preview: Optional[Tuple[float, float]] = None
+        self.world_undo_stack: List[WorldConfig] = []
+        self.world_redo_stack: List[WorldConfig] = []
+        self.view_rotation: float = 0.0
+        self.rotate_active: bool = False
+        self.rotate_anchor: Optional[Tuple[int, int]] = None
+        self.rotate_start_angle: float = 0.0
+        self.creation_context: str = "robot"  # robot | environment | custom
+        self.shape_tool: str = "rect"  # rect | triangle | line
+        self.shape_start: Optional[Tuple[float, float]] = None
+        self.shape_preview: Optional[Tuple[float, float]] = None
+        self.active_tab: str = "robot"  # robot | environment | custom
+        self.robot_dirty: bool = False
+        self.env_dirty: bool = False
+        self.custom_dirty: bool = False
+        self.robot_design_name: str = "untitled_robot"
+        self.env_design_name: str = "untitled_env"
+        self.custom_design_name: str = "untitled_custom"
+        self.custom_active: Optional[CustomObjectConfig] = None
+        self.pending_tab: Optional[str] = None
+        self.pending_dialog: Optional[pygame_gui.windows.UIConfirmationDialog] = None
+        self.custom_undo_stack: List[CustomObjectConfig] = []
+        self.custom_redo_stack: List[CustomObjectConfig] = []
+
+        # UI helpers
+        self.custom_message = ""
 
         self._build_ui()
         self._init_hover_menu()
-        self._load_scenario()
+        self._init_blank_workspaces()
 
     def _build_ui(self) -> None:
         self.dropdown = pygame_gui.elements.UIDropDownMenu(
-            options_list=self.scenario_names or ["<none>"],
+            options_list=(["<none>"] + self.scenario_names) if self.scenario_names else ["<none>"],
             starting_option=self.scenario_name or "<none>",
             relative_rect=pygame.Rect((20, 20), (200, 30)),
             manager=self.manager,
@@ -232,6 +286,16 @@ class DesignerApp:
             font=font,
         )
 
+    def _init_blank_workspaces(self) -> None:
+        """Start with blank robot/environment/custom instead of autoloading a scenario."""
+        self._new_design("robot")
+        self._new_design("environment")
+        self._new_design("custom")
+        self._dirty_flag("robot", False)
+        self._dirty_flag("environment", False)
+        self._dirty_flag("custom", False)
+        self.status_hint = "Blank workspace: open or create a robot/env/custom, or load a scenario when ready."
+
     # Menu helpers for hover menus
     def _select_scenario_menu(self, name: str) -> None:
         self.scenario_name = name if name and name != "<none>" else None
@@ -245,6 +309,23 @@ class DesignerApp:
         self._refresh_body_dropdown()
         self._refresh_hover_menu()
 
+    def _controller_choices(self) -> List[str]:
+        if not self.scenario_name:
+            return []
+        scenario_path = self.scenario_root / self.scenario_name
+        if not scenario_path.exists():
+            return []
+        names = sorted({p.stem for p in scenario_path.glob("controller*.py")})
+        return names or ["controller"]
+
+    def _set_controller_module(self, module_name: str) -> None:
+        if not self.robot_cfg:
+            return
+        self.robot_cfg.controller_module = module_name
+        self.status_hint = f"Controller set to {module_name}.py"
+        self._rebuild_sim()
+        self._refresh_hover_menu()
+
     def _set_device_type(self, kind: str) -> None:
         if not kind:
             return
@@ -253,6 +334,24 @@ class DesignerApp:
         self.pending_device_type = kind
         self.status_hint = f"Device type: {kind}"
         self._refresh_hover_menu()
+
+    def _set_creation_context(self, context: str) -> None:
+        if context not in ("robot", "environment", "custom"):
+            return
+        self.creation_context = context
+        self.status_hint = f"Context: {context}"
+        self._refresh_hover_menu()
+
+    def _set_shape_tool(self, tool: str) -> None:
+        if tool not in ("rect", "triangle", "line"):
+            return
+        self.shape_tool = tool
+        self.status_hint = f"Shape tool: {tool}"
+        self._refresh_hover_menu()
+
+    def _update_brush_label(self) -> None:
+        if self.brush_label:
+            self.brush_label.set_text(f"{self.env_brush_thickness:.3f} m")
 
     def _enter_add_device(self) -> None:
         if not self.pending_device_type:
@@ -276,6 +375,35 @@ class DesignerApp:
             {"label": kind, "action": (lambda k=kind: _set_and_enter(k)), "checked": (lambda k=kind: (self.device_dropdown.selected_option == k))}
             for kind in device_types
         ]
+        brush_sizes = [("Thin", 0.02), ("Medium", 0.05), ("Thick", 0.1)]
+        env_entries: List[Dict[str, object]] = [
+            {"label": "Draw mark", "action": lambda: self._set_env_tool("mark"), "checked": lambda: self.env_tool == "mark"},
+            {"label": "Draw wall", "action": lambda: self._set_env_tool("wall"), "checked": lambda: self.env_tool == "wall"},
+        ]
+        env_entries += [
+            {
+                "label": f"Brush {label}",
+                "action": (lambda t=val: self._set_brush_thickness(t)),
+                "checked": (lambda t=val: abs(self.env_brush_thickness - t) < 1e-6),
+            }
+            for label, val in brush_sizes
+        ]
+        env_entries += [
+            {"label": "Exit env drawing", "action": lambda: self._set_env_tool("off"), "checked": lambda: self.env_tool == "off"},
+            {"label": "Clear drawings", "action": self._clear_env_drawings},
+            {"label": "Set bounds (drag)", "action": self._start_bounds_mode, "checked": lambda: self.bounds_mode},
+            {"label": "Clear bounds", "action": self._clear_bounds},
+            {"label": "Undo env", "action": self._undo_world},
+            {"label": "Redo env", "action": self._redo_world},
+        ]
+        controller_entries = [
+            {
+                "label": f"Use {name}.py",
+                "action": (lambda n=name: self._set_controller_module(n)),
+                "checked": (lambda n=name: getattr(self.robot_cfg, "controller_module", "controller") == n),
+            }
+            for name in self._controller_choices()
+        ] or [{"label": "<no controllers>", "action": lambda: None}]
         self.hover_menu = HoverMenu(
             [
                 ("Scenario", [{"label": "Reload", "action": self._load_scenario}] + scenario_entries),
@@ -293,15 +421,80 @@ class DesignerApp:
                         {"label": "Select/Move", "action": lambda: self._set_mode("select")},
                         {"label": "Add point", "action": lambda: self._set_mode("add")},
                         {"label": "Delete point", "action": lambda: self._set_mode("delete")},
+                        {"label": "Draw shape", "action": lambda: self._set_mode("draw_shape")},
                     ],
                 ),
                 ("Body", body_entries or [{"label": "<none>", "action": lambda: None}]),
-                ("Devices", device_entries + [{"label": "Place device", "action": self._enter_add_device}]),
+                (
+                    "Devices",
+                    device_entries
+                    + [
+                        {"label": "Place device", "action": self._enter_add_device},
+                        {"label": "Advanced (selected)", "action": self._open_advanced_view},
+                    ],
+                ),
+                ("Controller", controller_entries),
+                ("Environment", env_entries),
+                (
+                    "Shapes",
+                    [
+                        {"label": "Rectangle", "action": lambda: self._set_shape_tool("rect"), "checked": lambda: self.shape_tool == "rect"},
+                        {
+                            "label": "Triangle",
+                            "action": lambda: self._set_shape_tool("triangle"),
+                            "checked": lambda: self.shape_tool == "triangle",
+                        },
+                        {"label": "Line", "action": lambda: self._set_shape_tool("line"), "checked": lambda: self.shape_tool == "line"},
+                        {"label": "Enter draw shape", "action": lambda: self._set_mode("draw_shape")},
+                    ],
+                ),
+                (
+                    "Tab",
+                    [
+                        {"label": "Robot", "action": lambda: self._switch_tab("robot"), "checked": lambda: self.active_tab == "robot"},
+                        {"label": "Environment", "action": lambda: self._switch_tab("environment"), "checked": lambda: self.active_tab == "environment"},
+                        {"label": "Custom", "action": lambda: self._switch_tab("custom"), "checked": lambda: self.active_tab == "custom"},
+                    ],
+                ),
+                (
+                    "Robot design",
+                    [
+                        {"label": "New", "action": lambda: self._new_design("robot")},
+                        {"label": "Open", "action": lambda: self._open_design("robot")},
+                        {"label": "Save", "action": lambda: self._save_design("robot")},
+                        {"label": "Save As", "action": lambda: self._save_design("robot", save_as=True)},
+                    ],
+                ),
+                (
+                    "Environment design",
+                    [
+                        {"label": "New", "action": lambda: self._new_design("environment")},
+                        {"label": "Open", "action": lambda: self._open_design("environment")},
+                        {"label": "Save", "action": lambda: self._save_design("environment")},
+                        {"label": "Save As", "action": lambda: self._save_design("environment", save_as=True)},
+                    ],
+                ),
+                (
+                    "Custom asset",
+                    [
+                        {"label": "New", "action": lambda: self._new_design("custom")},
+                        {"label": "Open", "action": lambda: self._open_design("custom")},
+                        {"label": "Save", "action": lambda: self._save_design("custom")},
+                        {"label": "Save As", "action": lambda: self._save_design("custom", save_as=True)},
+                    ],
+                ),
                 (
                     "View",
                     [
                         {"label": "Reset view", "action": self._view_reset},
                         {"label": "Toggle grid", "action": self._view_toggle_grid, "checked": lambda: self.grid_enabled},
+                        {"label": "Reset rotation", "action": self._view_reset_rotation},
+                    ],
+                ),
+                (
+                    "Export",
+                    [
+                        {"label": "Export scenario", "action": self._export_scenario},
                     ],
                 ),
             ],
@@ -309,16 +502,190 @@ class DesignerApp:
             font=font,
         )
 
+    # --- Tab + design helpers ---------------------------------------------
+    def _design_root(self, kind: str) -> Path:
+        base = self.base_path / "designs"
+        if kind == "robot":
+            return base / "robots"
+        if kind == "environment":
+            return base / "environments"
+        return base / "custom"
+
+    def _dirty_flag(self, kind: str, value: Optional[bool] = None) -> bool:
+        if value is None:
+            return self.robot_dirty if kind == "robot" else self.env_dirty if kind == "environment" else self.custom_dirty
+        if kind == "robot":
+            self.robot_dirty = value
+        elif kind == "environment":
+            self.env_dirty = value
+        else:
+            self.custom_dirty = value
+        return value
+
+    def _switch_tab(self, tab: str) -> None:
+        if tab == self.active_tab:
+            return
+        # prompt if dirty
+        current_dirty = self._dirty_flag(self.active_tab)
+        if current_dirty and not self.pending_dialog:
+            self.pending_tab = tab
+            self.pending_dialog = pygame_gui.windows.UIConfirmationDialog(
+                rect=pygame.Rect((self.window_size[0] // 2 - 160, self.window_size[1] // 2 - 60), (320, 120)),
+                manager=self.manager,
+                window_title="Save changes?",
+                action_long_desc=f"Save {self.active_tab} design before switching?",
+                action_short_name="Save",
+                blocking=True,
+            )
+            return
+        self._apply_tab_switch(tab)
+
+    def _apply_tab_switch(self, tab: str) -> None:
+        self.active_tab = tab
+        self.creation_context = tab
+        if tab != "environment":
+            self.env_tool = "off"
+            self.env_drawing = False
+        self.shape_start = None
+        self.shape_preview = None
+        self.mode = "select"
+        self.selected_point = None
+        self.selected_points.clear()
+        self.selected_device = None
+        self._update_mode_buttons()
+        self._refresh_hover_menu()
+        self.status_hint = f"Switched to {tab} tab"
+
+    def _new_design(self, kind: str) -> None:
+        if kind == "robot":
+            self.robot_cfg = RobotConfig()
+            self.body_name = None
+            self._after_state_change()
+            self.robot_design_name = "untitled_robot"
+            self._dirty_flag("robot", True)
+        elif kind == "environment":
+            self.world_cfg = WorldConfig()
+            self._ensure_world_defaults()
+            self._after_world_change()
+            self.env_design_name = "untitled_env"
+            self._dirty_flag("environment", True)
+        else:
+            self.custom_active = None
+            self.custom_design_name = "untitled_custom"
+            self._dirty_flag("custom", True)
+        self.status_hint = f"New {kind} design"
+
+    def _open_design(self, kind: str) -> None:
+        root = self._design_root(kind)
+        if not root.exists():
+            self.status_hint = f"No {kind} designs yet"
+            return
+        files = sorted(root.glob("*.json"))
+        if not files:
+            self.status_hint = f"No {kind} designs found"
+            return
+        path = files[0]
+        try:
+            if kind == "robot":
+                self.robot_cfg = load_robot_design(path)
+                self._after_state_change()
+                self.robot_design_name = path.stem
+                self._dirty_flag("robot", False)
+            elif kind == "environment":
+                self.world_cfg = load_environment_design(path)
+                self._ensure_world_defaults()
+                self._after_world_change()
+                self.env_design_name = path.stem
+                self._dirty_flag("environment", False)
+            else:
+                self.custom_active = load_custom_asset(path)
+                self.custom_design_name = path.stem
+                self._dirty_flag("custom", False)
+            self.status_hint = f"Opened {kind} design {path.stem}"
+        except Exception as exc:
+            self.status_hint = f"Failed to open {kind}: {exc}"
+
+    def _save_design(self, kind: str, save_as: bool = False) -> None:
+        root = self._design_root(kind)
+        root.mkdir(parents=True, exist_ok=True)
+        name = getattr(self, f"{kind}_design_name", f"untitled_{kind}")
+        if save_as:
+            name = f"{name}_copy"
+        path = root / f"{name}.json"
+        try:
+            if kind == "robot" and self.robot_cfg:
+                save_robot_design(path, self.robot_cfg)
+                self.robot_design_name = name
+                self._dirty_flag("robot", False)
+            elif kind == "environment" and self.world_cfg:
+                save_environment_design(path, self.world_cfg)
+                self.env_design_name = name
+                self._dirty_flag("environment", False)
+            elif kind == "custom" and self.custom_active:
+                save_custom_asset(path, self.custom_active)
+                self.custom_design_name = name
+                self._dirty_flag("custom", False)
+            else:
+                self.status_hint = f"Nothing to save for {kind}"
+                return
+            self.status_hint = f"Saved {kind} design to {path.name}"
+        except Exception as exc:
+            self.status_hint = f"Failed to save {kind}: {exc}"
+
+    def _export_scenario(self) -> None:
+        if not self.scenario_name:
+            self.status_hint = "No scenario selected to export"
+            return
+        target = self.scenario_root / self.scenario_name
+        if not target.exists():
+            target.mkdir(parents=True, exist_ok=True)
+        if not (self.world_cfg and self.robot_cfg):
+            self.status_hint = "Need robot and environment to export"
+            return
+        save_scenario(target, self.world_cfg, self.robot_cfg)
+        self.status_hint = f"Exported scenario to {self.scenario_name}"
+    def _ensure_world_defaults(self) -> None:
+        if not self.world_cfg:
+            return
+        if getattr(self.world_cfg, "drawings", None) is None:
+            self.world_cfg.drawings = []
+        if not hasattr(self.world_cfg, "bounds"):
+            self.world_cfg.bounds = None
+        if not hasattr(self.world_cfg, "shape_objects") or self.world_cfg.shape_objects is None:
+            self.world_cfg.shape_objects = []
+        if not hasattr(self.world_cfg, "custom_objects") or self.world_cfg.custom_objects is None:
+            self.world_cfg.custom_objects = []
+        if not hasattr(self.world_cfg, "designer_state") or self.world_cfg.designer_state is None:
+            self.world_cfg.designer_state = DesignerState()
+        if not self.custom_active and self.world_cfg.custom_objects:
+            self.custom_active = self.world_cfg.custom_objects[0]
+
+    def _w2s(self, point: Tuple[float, float]) -> Tuple[int, int]:
+        return world_to_screen(point, self.viewport_rect, self.scale, self.offset, self.view_rotation)
+
+    def _s2w(self, pos: Tuple[int, int]) -> Tuple[float, float]:
+        return screen_to_world(pos, self.viewport_rect, self.scale, self.offset, self.view_rotation)
+
     def _load_scenario(self) -> None:
         if not self.scenario_name:
             return
         scenario_path = self.scenario_root / self.scenario_name
         self.world_cfg, self.robot_cfg = load_scenario(scenario_path)
+        self._ensure_world_defaults()
+        ds = getattr(self.world_cfg, "designer_state", DesignerState())
+        self.creation_context = getattr(ds, "creation_context", "robot") or "robot"
+        self.mode = getattr(ds, "mode", "select") or "select"
+        self.env_brush_thickness = float(getattr(ds, "brush_thickness", self.env_brush_thickness))
+        self.shape_tool = getattr(ds, "shape_tool", "rect") or "rect"
+        brush_kind = getattr(ds, "brush_kind", "mark") or "mark"
+        self.env_tool = brush_kind if brush_kind in ("mark", "wall") else "off"
         self.body_name = self.robot_cfg.bodies[0].name if self.robot_cfg.bodies else None
         self._refresh_body_dropdown()
         self._rebuild_sim()
         self.undo_stack.clear()
         self.redo_stack.clear()
+        self.world_undo_stack.clear()
+        self.world_redo_stack.clear()
         self._populate_inspector_from_selection()
         self._update_mode_buttons()
         self._refresh_hover_menu()
@@ -361,9 +728,73 @@ class DesignerApp:
         if len(self.undo_stack) > 50:
             self.undo_stack.pop(0)
         self.redo_stack.clear()
+        self.robot_dirty = True
+
+    def _push_world_undo_state(self) -> None:
+        if not self.world_cfg:
+            return
+        self.world_undo_stack.append(copy.deepcopy(self.world_cfg))
+        if len(self.world_undo_stack) > 50:
+            self.world_undo_stack.pop(0)
+        self.world_redo_stack.clear()
+        if self.active_tab == "environment":
+            self.env_dirty = True
+        elif self.active_tab == "custom":
+            self.custom_dirty = True
+
+    def _after_world_change(self) -> None:
+        self._ensure_world_defaults()
+        self._rebuild_sim(preserve_selection=True)
+        self._refresh_hover_menu()
+
+    def _undo_world(self) -> None:
+        if not self.world_undo_stack:
+            return
+        prev = self.world_undo_stack.pop()
+        if self.world_cfg:
+            self.world_redo_stack.append(copy.deepcopy(self.world_cfg))
+        self.world_cfg = copy.deepcopy(prev)
+        self._after_world_change()
+
+    def _redo_world(self) -> None:
+        if not self.world_redo_stack:
+            return
+        nxt = self.world_redo_stack.pop()
+        if self.world_cfg:
+            self.world_undo_stack.append(copy.deepcopy(self.world_cfg))
+        self.world_cfg = copy.deepcopy(nxt)
+        self._after_world_change()
+
+    def _push_custom_undo(self) -> None:
+        if not self.custom_active:
+            return
+        self.custom_undo_stack.append(copy.deepcopy(self.custom_active))
+        if len(self.custom_undo_stack) > 50:
+            self.custom_undo_stack.pop(0)
+        self.custom_redo_stack.clear()
+        self.custom_dirty = True
+
+    def _undo_custom(self) -> None:
+        if not self.custom_undo_stack:
+            return
+        prev = self.custom_undo_stack.pop()
+        if self.custom_active:
+            self.custom_redo_stack.append(copy.deepcopy(self.custom_active))
+        self.custom_active = prev
+        self.custom_dirty = True
+
+    def _redo_custom(self) -> None:
+        if not self.custom_redo_stack:
+            return
+        nxt = self.custom_redo_stack.pop()
+        if self.custom_active:
+            self.custom_undo_stack.append(copy.deepcopy(self.custom_active))
+        self.custom_active = nxt
+        self.custom_dirty = True
 
     def _after_state_change(self) -> None:
         # Keep body selection valid and rebuild runtime objects.
+        self._ensure_world_defaults()
         if self.robot_cfg:
             bodies = [b.name for b in self.robot_cfg.bodies]
             if self.body_name not in bodies:
@@ -393,6 +824,9 @@ class DesignerApp:
         self.mode = mode
         if mode != "add_device":
             self.pending_device_type = None
+        if mode != "draw_shape":
+            self.shape_start = None
+            self.shape_preview = None
         try:
             if mode in ("add", "add_device"):
                 pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_CROSSHAIR)
@@ -410,6 +844,8 @@ class DesignerApp:
         elif mode == "add_device":
             dtype = self.pending_device_type or self.device_dropdown.selected_option or "device"
             self.status_hint = f"Click to place {dtype} on the body."
+        elif mode == "draw_shape":
+            self.status_hint = f"Draw {self.shape_tool} ({self.creation_context})"
         else:
             self.status_hint = "Select and drag points or devices. Right-drag to pan."
         self._update_mode_buttons()
@@ -743,6 +1179,44 @@ class DesignerApp:
         self.selected_device = (kind, new_name)
         self._populate_inspector_from_selection()
 
+    def _open_advanced_view(self) -> None:
+        if not self.selected_device or not self.robot_cfg:
+            self.status_hint = "Select a device to open advanced view"
+            return
+        kind, name = self.selected_device
+        cfg = None
+        if kind == "actuator":
+            cfg = next((a for a in self.robot_cfg.actuators if a.name == name), None)
+        elif kind == "sensor":
+            cfg = next((s for s in self.robot_cfg.sensors if s.name == name), None)
+        if not cfg:
+            self.status_hint = "Device missing"
+            return
+        payload = {
+            "name": getattr(cfg, "name", name),
+            "type": getattr(cfg, "type", kind),
+            "body": getattr(cfg, "body", ""),
+            "mount_pose": getattr(cfg, "mount_pose", (0, 0, 0)),
+            "params": getattr(cfg, "params", {}),
+        }
+        html = "<br>".join(
+            [
+                f"<b>Name</b>: {payload['name']}",
+                f"<b>Type</b>: {payload['type']}",
+                f"<b>Body</b>: {payload['body']}",
+                f"<b>Pose</b>: {payload['mount_pose']}",
+                f"<b>Params</b>: {json.dumps(payload['params'], indent=2)}",
+                "Edit params in the inspector text fields then click Apply.",
+            ]
+        )
+        pygame_gui.windows.UIMessageWindow(
+            rect=pygame.Rect((self.window_size[0] - 360, 440), (320, 260)),
+            manager=self.manager,
+            window_title=f"Advanced: {name}",
+            html_message=html,
+        )
+        self.status_hint = "Advanced view opened"
+
     def _delete_selected_device(self) -> None:
         if not self.selected_device or not self.robot_cfg:
             return
@@ -771,10 +1245,21 @@ class DesignerApp:
                     if event.key in (pygame.K_MINUS, pygame.K_UNDERSCORE):
                         self.scale /= 1.1
                     if event.key == pygame.K_z and (event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META | pygame.KMOD_GUI)):
-                        if event.mod & pygame.KMOD_SHIFT:
-                            self._redo()
+                        if self.active_tab == "custom":
+                            if event.mod & pygame.KMOD_SHIFT:
+                                self._redo_custom()
+                            else:
+                                self._undo_custom()
+                        elif self.active_tab == "environment":
+                            if event.mod & pygame.KMOD_SHIFT:
+                                self._redo_world()
+                            else:
+                                self._undo_world()
                         else:
-                            self._undo()
+                            if event.mod & pygame.KMOD_SHIFT:
+                                self._redo()
+                            else:
+                                self._undo()
                     if event.key == pygame.K_c and (event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META | pygame.KMOD_GUI)):
                         self._copy_selection()
                     if event.key == pygame.K_v and (event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META | pygame.KMOD_GUI)):
@@ -783,7 +1268,13 @@ class DesignerApp:
                     if self.viewport_rect.collidepoint(pygame.mouse.get_pos()):
                         self.scale *= 1.0 + 0.1 * event.y
                 if event.type == pygame.MOUSEBUTTONDOWN:
-                    if event.button in (2, 3):  # middle/right -> pan
+                    mods = pygame.key.get_mods()
+                    shift = bool(mods & pygame.KMOD_SHIFT)
+                    if event.button in (2, 3) and shift:
+                        self.rotate_active = True
+                        self.rotate_anchor = event.pos
+                        self.rotate_start_angle = self.view_rotation
+                    elif event.button in (2, 3):  # middle/right -> pan
                         self.pan_active = True
                         self.pan_start = event.pos
                     elif event.button == 1 and self.viewport_rect.collidepoint(event.pos):
@@ -792,7 +1283,19 @@ class DesignerApp:
                     if event.button in (2, 3):
                         self.pan_active = False
                         self.pan_start = None
+                        if self.rotate_active:
+                            self.rotate_active = False
+                            self.rotate_anchor = None
                     if event.button == 1:
+                        if self.mode == "draw_shape" and self.shape_start:
+                            self._finalize_shape(self._s2w(event.pos))
+                        if self.env_drawing:
+                            self._finalize_env_stroke()
+                        if self.bounds_mode and self.bounds_start:
+                            self.bounds_preview = screen_to_world(
+                                event.pos, self.viewport_rect, self.scale, self.offset
+                            )
+                            self._finalize_bounds()
                         if self.dragging:
                             self.dragging = False
                             self.drag_mode = None
@@ -817,6 +1320,21 @@ class DesignerApp:
         pygame.quit()
 
     def _handle_ui_event(self, event: pygame.event.Event) -> None:
+        if event.type == pygame_gui.UI_CONFIRMATION_DIALOG_CONFIRMED and self.pending_dialog:
+            if self.pending_tab:
+                # Save current tab then switch
+                self._save_design(self.active_tab)
+                self._apply_tab_switch(self.pending_tab)
+                self.pending_tab = None
+            self.pending_dialog = None
+            return
+        if event.type == pygame_gui.UI_WINDOW_CLOSE and self.pending_dialog and event.ui_element == self.pending_dialog:
+            # user closed without saving
+            if self.pending_tab:
+                self._apply_tab_switch(self.pending_tab)
+                self.pending_tab = None
+            self.pending_dialog = None
+            return
         if event.type == pygame_gui.UI_DROP_DOWN_MENU_CHANGED:
             if event.ui_element == self.dropdown:
                 self.scenario_name = event.text if event.text != "<none>" else None
@@ -851,6 +1369,10 @@ class DesignerApp:
         self.scale = 400.0
         self.status_hint = "View reset"
 
+    def _view_reset_rotation(self) -> None:
+        self.view_rotation = 0.0
+        self.status_hint = "Rotation reset"
+
     def _view_toggle_grid(self) -> None:
         self.grid_enabled = not self.grid_enabled
         self.status_hint = "Grid on" if self.grid_enabled else "Grid off (clean view)"
@@ -858,8 +1380,257 @@ class DesignerApp:
     def _save_scenario(self) -> None:
         if not (self.world_cfg and self.robot_cfg and self.scenario_name):
             return
+        brush_kind = self.env_tool if self.env_tool in ("mark", "wall") else "mark"
+        self.world_cfg.designer_state = DesignerState(
+            creation_context=self.creation_context,
+            mode=self.mode,
+            brush_kind=brush_kind,
+            brush_thickness=self.env_brush_thickness,
+            shape_tool=self.shape_tool,
+        )
         save_scenario(self.scenario_root / self.scenario_name, self.world_cfg, self.robot_cfg)
         print(f"Saved scenario {self.scenario_name}")
+
+    # --- Environment drawing/bounds -------------------------------------
+    def _set_env_tool(self, tool: str) -> None:
+        if self.active_tab != "environment":
+            self.status_hint = "Switch to Environment tab to draw"
+            self.env_tool = "off"
+            self._refresh_hover_menu()
+            return
+        self.env_tool = tool
+        self.env_drawing = False
+        self.env_stroke_points.clear()
+        if tool == "off":
+            self.status_hint = "Environment drawing off"
+        elif tool == "wall":
+            self.status_hint = "Drawing walls: click-drag to paint segments"
+        else:
+            self.status_hint = "Drawing marks: click-drag to paint"
+        self._refresh_hover_menu()
+
+    def _set_brush_thickness(self, thickness: float) -> None:
+        self.env_brush_thickness = max(0.005, float(thickness))
+        self.status_hint = f"Brush thickness {self.env_brush_thickness:.3f} m"
+        self._update_brush_label()
+        self._refresh_hover_menu()
+
+    def _clear_env_drawings(self) -> None:
+        if self.active_tab != "environment":
+            self.status_hint = "Switch to Environment tab to clear drawings"
+            return
+        if not self.world_cfg or not getattr(self.world_cfg, "drawings", None):
+            return
+        self._push_world_undo_state()
+        self.world_cfg.drawings = []
+        self._after_world_change()
+        self.status_hint = "Cleared environment drawings"
+
+    def _start_bounds_mode(self) -> None:
+        if self.active_tab != "environment":
+            self.status_hint = "Switch to Environment tab to set bounds"
+            return
+        self.bounds_mode = True
+        self.bounds_start = None
+        self.bounds_preview = None
+        self.status_hint = "Bounds: click-drag to set rectangle"
+        self._refresh_hover_menu()
+
+    def _clear_bounds(self) -> None:
+        if self.active_tab != "environment":
+            self.status_hint = "Switch to Environment tab to clear bounds"
+            return
+        if not self.world_cfg or not getattr(self.world_cfg, "bounds", None):
+            return
+        self._push_world_undo_state()
+        self.world_cfg.bounds = None
+        self._after_world_change()
+        self.status_hint = "Bounds cleared"
+
+    def _stroke_color(self, kind: str) -> Tuple[int, int, int]:
+        if kind == "wall":
+            return (200, 160, 120)
+        return (140, 200, 255)
+
+    def _unique_shape_name(self, base: str, for_robot: bool) -> str:
+        suffix = 1
+        existing = set()
+        if for_robot and self.robot_cfg:
+            existing.update([b.name for b in self.robot_cfg.bodies])
+        shapes = getattr(self.world_cfg, "shape_objects", []) or []
+        existing.update([getattr(o, "name", "") for o in shapes])
+        customs = getattr(self.world_cfg, "custom_objects", []) or []
+        existing.update([getattr(o, "name", "") for o in customs])
+        while True:
+            candidate = f"{base}_{suffix}"
+            if candidate not in existing:
+                return candidate
+            suffix += 1
+
+    def _build_shape_body(self, start: Tuple[float, float], end: Tuple[float, float]) -> Optional[BodyConfig]:
+        sx, sy = start
+        ex, ey = end
+        if self.shape_tool == "rect":
+            minx, maxx = sorted([sx, ex])
+            miny, maxy = sorted([sy, ey])
+            if abs(maxx - minx) < 1e-4 or abs(maxy - miny) < 1e-4:
+                return None
+            pts = [(minx, miny), (minx, maxy), (maxx, maxy), (maxx, miny)]
+        elif self.shape_tool == "triangle":
+            pts = [(sx, sy), (ex, sy), (ex, ey)]
+            if math.hypot(ex - sx, ey - sy) < 1e-4:
+                return None
+        else:  # line -> thin rectangle
+            dx = ex - sx
+            dy = ey - sy
+            seg_len = math.hypot(dx, dy)
+            if seg_len < 1e-4:
+                return None
+            nx = -dy / seg_len * (self.env_brush_thickness / 2.0)
+            ny = dx / seg_len * (self.env_brush_thickness / 2.0)
+            pts = [
+                (sx + nx, sy + ny),
+                (ex + nx, ey + ny),
+                (ex - nx, ey - ny),
+                (sx - nx, sy - ny),
+            ]
+        edges = [(i, (i + 1) % len(pts)) for i in range(len(pts))]
+        name = self._unique_shape_name(self.shape_tool, self.creation_context == "robot")
+        return BodyConfig(
+            name=name,
+            points=[(float(x), float(y)) for x, y in pts],
+            edges=edges,
+            pose=(0.0, 0.0, 0.0),
+            can_move=self.creation_context == "robot",
+            mass=1.0,
+            inertia=1.0,
+        )
+
+    def _custom_dir(self) -> Path:
+        return self._design_root("custom")
+
+    def _save_custom_body(self, body_cfg: BodyConfig, name_override: Optional[str] = None) -> Optional[Path]:
+        try:
+            target_dir = self._custom_dir()
+            target_dir.mkdir(parents=True, exist_ok=True)
+            fname = (name_override or body_cfg.name) + ".json"
+            target_path = target_dir / fname
+            save_json(target_path, body_cfg)
+            return target_path
+        except Exception as exc:
+            print(f"Failed to save custom object: {exc}")
+            return None
+
+    def _add_shape_object(self, body_cfg: BodyConfig) -> None:
+        if not self.world_cfg:
+            return
+        if self.creation_context == "robot":
+            self._push_undo_state()
+            if self.robot_cfg:
+                self.robot_cfg.bodies.append(body_cfg)
+                self._after_state_change()
+            return
+        if self.creation_context == "custom":
+            self._push_custom_undo()
+            self.custom_active = CustomObjectConfig(name=body_cfg.name, body=body_cfg, kind="custom")
+            self.custom_dirty = True
+            return
+        self._push_world_undo_state()
+        wrapper = WorldObjectConfig(name=body_cfg.name, body=body_cfg)
+        self.world_cfg.shape_objects.append(wrapper)  # type: ignore[arg-type]
+        self._after_world_change()
+
+    def _finalize_shape(self, end_point: Tuple[float, float]) -> None:
+        if not self.shape_start:
+            return
+        body_cfg = self._build_shape_body(self.shape_start, end_point)
+        self.shape_start = None
+        self.shape_preview = None
+        if not body_cfg:
+            return
+        self._add_shape_object(body_cfg)
+        self.status_hint = f"Added {self.shape_tool} ({self.creation_context})"
+        if self.creation_context == "custom":
+            self.custom_dirty = True
+
+    def _save_selection_as_custom(self) -> None:
+        body_cfg = self._current_body_cfg()
+        if not body_cfg:
+            return
+        clone = copy.deepcopy(body_cfg)
+        clone.name = self._unique_shape_name(clone.name or "custom", False)
+        self.custom_active = CustomObjectConfig(name=clone.name, body=clone, kind="custom")
+        saved = self._save_custom_body(clone)
+        if saved:
+            self.custom_design_name = clone.name
+            self.custom_dirty = False
+            self.status_hint = f"Saved custom object to {saved.name}"
+
+    def _import_custom_object(self) -> None:
+        target_dir = self._custom_dir()
+        if not target_dir.exists():
+            self.status_hint = "No custom object folder yet"
+            return
+        json_files = sorted(target_dir.glob("*.json"))
+        if not json_files:
+            self.status_hint = "No custom objects to import"
+            return
+        path = json_files[0]
+        try:
+            asset = load_custom_asset(path)
+            asset.name = self._unique_shape_name(asset.name, False)
+            self.custom_active = asset
+            self.custom_dirty = False
+            self.custom_design_name = asset.name
+            self.status_hint = f"Imported custom {path.stem}"
+        except Exception as exc:
+            self.status_hint = f"Import failed: {exc}"
+    def _min_draw_spacing(self) -> float:
+        return 0.01
+
+    def _finalize_env_stroke(self) -> None:
+        if not self.world_cfg or not self.env_stroke_points:
+            self.env_drawing = False
+            self.env_stroke_points.clear()
+            return
+        pts = self.env_stroke_points.copy()
+        self.env_drawing = False
+        self.env_stroke_points.clear()
+        if len(pts) < 2:
+            return
+        self._push_world_undo_state()
+        stroke = StrokeConfig(
+            kind=self.env_tool if self.env_tool != "off" else "mark",
+            thickness=self.env_brush_thickness,
+            points=[(float(x), float(y)) for x, y in pts],
+            color=self._stroke_color(self.env_tool),
+        )
+        self.world_cfg.drawings.append(stroke)
+        self._after_world_change()
+        self.status_hint = f"Added {stroke.kind} stroke ({len(stroke.points)} pts)"
+
+    def _finalize_bounds(self) -> None:
+        if not self.world_cfg or not self.bounds_start or not self.bounds_preview:
+            self.bounds_mode = False
+            self.bounds_start = None
+            self.bounds_preview = None
+            return
+        x0, y0 = self.bounds_start
+        x1, y1 = self.bounds_preview
+        min_x, max_x = sorted([x0, x1])
+        min_y, max_y = sorted([y0, y1])
+        if max_x - min_x < 1e-4 or max_y - min_y < 1e-4:
+            self.bounds_mode = False
+            self.bounds_start = None
+            self.bounds_preview = None
+            return
+        self._push_world_undo_state()
+        self.world_cfg.bounds = EnvironmentBounds(min_x=min_x, min_y=min_y, max_x=max_x, max_y=max_y)
+        self._after_world_change()
+        self.bounds_mode = False
+        self.bounds_start = None
+        self.bounds_preview = None
+        self.status_hint = f"Bounds set ({min_x:.2f},{min_y:.2f})–({max_x:.2f},{max_y:.2f})"
 
     def _current_body_cfg(self) -> Optional[BodyConfig]:
         if not self.robot_cfg:
@@ -883,12 +1654,27 @@ class DesignerApp:
 
     def _handle_canvas_click(self, pos: Tuple[int, int], start_drag: bool = False) -> None:
         body_cfg = self._current_body_cfg()
-        if not body_cfg:
+        if not body_cfg and self.env_tool == "off" and not self.bounds_mode and self.mode != "draw_shape":
             return
         mods = pygame.key.get_mods()
         shift = bool(mods & pygame.KMOD_SHIFT)
         world_point = screen_to_world(pos, self.viewport_rect, self.scale, self.offset)
         self.hover_world = world_point
+        if self.bounds_mode:
+            if start_drag:
+                self.bounds_start = world_point
+                self.bounds_preview = world_point
+            return
+        if self.env_tool != "off" and self.active_tab == "environment":
+            if start_drag:
+                self.env_drawing = True
+                self.env_stroke_points = [world_point]
+            return
+        if self.mode == "draw_shape":
+            if start_drag:
+                self.shape_start = world_point
+                self.shape_preview = world_point
+            return
         if self.mode == "add_device":
             dtype = self.pending_device_type or self.device_dropdown.selected_option or "motor"
             if dtype:
@@ -970,18 +1756,20 @@ class DesignerApp:
                     self.drag_start_local = (float(local_point[0]), float(local_point[1]))
 
     def _handle_mouse_motion(self, event: pygame.event.Event) -> None:
+        if self.rotate_active and self.rotate_anchor:
+            dx = event.pos[0] - self.rotate_anchor[0]
+            dy = event.pos[1] - self.rotate_anchor[1]
+            self.view_rotation = self.rotate_start_angle + (dx - dy) * 0.005
+            return
         if self.pan_active and self.pan_start:
             dx = (event.pos[0] - self.pan_start[0]) / self.scale
             dy = (event.pos[1] - self.pan_start[1]) / self.scale
             self.offset = (self.offset[0] - dx, self.offset[1] + dy)
             self.pan_start = event.pos
             return
-        body_cfg = self._current_body_cfg()
-        if not body_cfg:
-            return
         mouse_pos = event.pos
         inside = self.viewport_rect.collidepoint(mouse_pos)
-        if not inside and not (self.dragging or self.dragging_device):
+        if not inside and not (self.dragging or self.dragging_device or self.env_drawing or self.bounds_mode):
             self.hover_point = None
             self.hover_device = None
             self.hover_world = None
@@ -993,6 +1781,21 @@ class DesignerApp:
         )
         world_point = screen_to_world(clamped_pos, self.viewport_rect, self.scale, self.offset)
         self.hover_world = world_point
+        if self.env_drawing and self.active_tab == "environment":
+            if self.env_stroke_points:
+                last = self.env_stroke_points[-1]
+                if math.hypot(world_point[0] - last[0], world_point[1] - last[1]) >= self._min_draw_spacing():
+                    self.env_stroke_points.append(world_point)
+            return
+        if self.mode == "draw_shape" and self.shape_start:
+            self.shape_preview = world_point
+            return
+        if self.bounds_mode and self.bounds_start:
+            self.bounds_preview = world_point
+            return
+        body_cfg = self._current_body_cfg()
+        if not body_cfg:
+            return
         local_point = self._body_pose(body_cfg).inverse().transform_point(world_point)
         self.hover_point = self._nearest_vertex(body_cfg, local_point, thresh=0.03)
         self.hover_device = self._pick_device(world_point)
@@ -1063,7 +1866,7 @@ class DesignerApp:
         pygame.draw.rect(self.window_surface, (70, 70, 80), self.viewport_rect, 1)
         # Clip drawing to the viewport to avoid overlaying UI
         self.window_surface.set_clip(self.viewport_rect)
-        if self.sim:
+        if self.sim and self.active_tab != "custom":
             self._draw_world()
         self.window_surface.set_clip(None)
         overlay_font = pygame.font.Font(pygame.font.get_default_font(), 14)
@@ -1085,6 +1888,13 @@ class DesignerApp:
         status = f"{mode_label} | {selection_label} | Scale: {self.scale:.1f} | Offset: ({self.offset[0]:.2f},{self.offset[1]:.2f})"
         if self.body_name:
             status += f" | Body: {self.body_name}"
+        if self.robot_cfg:
+            status += f" | Controller: {getattr(self.robot_cfg, 'controller_module', 'controller')}"
+        status += f" | Context: {self.creation_context}"
+        if self.env_tool != "off":
+            status += f" | Draw: {self.env_tool} ({self.env_brush_thickness:.2f}m)"
+        if self.mode == "draw_shape":
+            status += f" | Shape: {self.shape_tool}"
         text_surf = font.render(status, True, (220, 220, 220))
         self.window_surface.blit(text_surf, (20, self.window_size[1] - 42))
         hint_surf = font.render(self.status_hint, True, (180, 200, 220))
@@ -1099,21 +1909,80 @@ class DesignerApp:
             self.hover_menu.draw(self.window_surface)
         pygame.display.update()
 
+    def _draw_environment(self) -> None:
+        rot = getattr(self, "view_rotation", 0.0)
+        # Only render environment overlays on env/custom tabs
+        if self.active_tab not in ("environment", "custom"):
+            return
+        if self.active_tab == "environment" and self.world_cfg:
+            if getattr(self.world_cfg, "bounds", None):
+                b = self.world_cfg.bounds
+                assert b
+                corners = [
+                    (b.min_x, b.min_y),
+                    (b.min_x, b.max_y),
+                    (b.max_x, b.max_y),
+                    (b.max_x, b.min_y),
+                ]
+                pts = [world_to_screen(c, self.viewport_rect, self.scale, self.offset, rot) for c in corners]
+                pygame.draw.polygon(self.window_surface, (60, 80, 110), pts, max(1, int(0.02 * self.scale)))
+            strokes = getattr(self.world_cfg, "drawings", []) or []
+            for stroke in strokes:
+                if not getattr(stroke, "points", None) or len(stroke.points) < 2:
+                    continue
+                color = tuple(getattr(stroke, "color", self._stroke_color("mark")))
+                pts = [world_to_screen(p, self.viewport_rect, self.scale, self.offset, rot) for p in stroke.points]
+                width = max(1, int(max(1.0, stroke.thickness * self.scale)))
+                pygame.draw.lines(self.window_surface, color, False, pts, width)
+                if getattr(stroke, "kind", "mark") == "wall":
+                    pygame.draw.lines(self.window_surface, (40, 50, 60), False, pts, 1)
+            if self.env_drawing and self.env_stroke_points:
+                pts = self.env_stroke_points.copy()
+                if self.hover_world:
+                    pts.append(self.hover_world)
+                scr = [world_to_screen(p, self.viewport_rect, self.scale, self.offset, rot) for p in pts]
+                pygame.draw.lines(self.window_surface, (150, 200, 240), False, scr, max(1, int(self.env_brush_thickness * self.scale)))
+            if self.bounds_mode and self.bounds_start and self.bounds_preview:
+                x0, y0 = self.bounds_start
+                x1, y1 = self.bounds_preview
+                corners = [(x0, y0), (x0, y1), (x1, y1), (x1, y0)]
+                scr = [world_to_screen(c, self.viewport_rect, self.scale, self.offset, rot) for c in corners]
+                pygame.draw.polygon(self.window_surface, (120, 160, 200), scr, 1)
+        if self.mode == "draw_shape" and self.shape_start and self.shape_preview:
+            preview_body = self._build_shape_body(self.shape_start, self.shape_preview)
+            if preview_body:
+                pts = [world_to_screen(p, self.viewport_rect, self.scale, self.offset, rot) for p in preview_body.points]
+                if len(pts) >= 2:
+                    pygame.draw.polygon(self.window_surface, (120, 200, 255), pts, 2)
+        if self.active_tab == "custom" and self.custom_active:
+            body = self.custom_active.body
+            pts = [world_to_screen(p, self.viewport_rect, self.scale, self.offset, rot) for p in body.points]
+            if len(pts) >= 3:
+                pygame.draw.polygon(self.window_surface, (150, 180, 240), pts, 0)
+                pygame.draw.polygon(self.window_surface, (60, 80, 120), pts, 2)
+
     def _draw_world(self) -> None:
         assert self.sim
         # grid
         if self.grid_enabled:
             self._draw_grid()
+        self._draw_environment()
         for body in self.sim.bodies.values():
             color = getattr(body.material, "custom", {}).get("color", None) or (140, 140, 200)
-            # Skip static world/terrain so designer stays focused on the robot
-            if not body.can_move:
-                continue
             if isinstance(body.shape, Polygon):
-                draw_polygon(self.window_surface, self.viewport_rect, body.shape, color, self.scale, self.offset, pose=body.pose)
+                draw_polygon(
+                    self.window_surface,
+                    self.viewport_rect,
+                    body.shape,
+                    color,
+                    self.scale,
+                    self.offset,
+                    rotation=self.view_rotation,
+                    pose=body.pose,
+                )
                 verts = body.shape._world_vertices(body.pose)
                 for idx, v in enumerate(verts):
-                    p = world_to_screen(v, self.viewport_rect, self.scale, self.offset)
+                    p = world_to_screen(v, self.viewport_rect, self.scale, self.offset, self.view_rotation)
                     radius = 5
                     color_point = (240, 200, 120)
                     if self.hover_point == idx:
@@ -1136,7 +2005,7 @@ class DesignerApp:
                     (maxx, maxy),
                     (maxx, miny),
                 ]
-                screen_pts = [world_to_screen(body_pose.transform_point(c), self.viewport_rect, self.scale, self.offset) for c in corners]
+                screen_pts = [world_to_screen(body_pose.transform_point(c), self.viewport_rect, self.scale, self.offset, self.view_rotation) for c in corners]
                 pygame.draw.polygon(self.window_surface, (80, 120, 180), screen_pts, 1)
                 handles = self._selection_handles(body_cfg)
                 for rect in handles.values():
@@ -1144,7 +2013,7 @@ class DesignerApp:
                     pygame.draw.rect(self.window_surface, (40, 60, 90), rect, 1)
         # hovered crosshair for alignment
         if self.hover_world and self.viewport_rect.collidepoint(pygame.mouse.get_pos()):
-            hx, hy = world_to_screen(self.hover_world, self.viewport_rect, self.scale, self.offset)
+            hx, hy = world_to_screen(self.hover_world, self.viewport_rect, self.scale, self.offset, self.view_rotation)
             pygame.draw.line(self.window_surface, (90, 120, 180), (hx - 8, hy), (hx + 8, hy), 1)
             pygame.draw.line(self.window_surface, (90, 120, 180), (hx, hy - 8), (hx, hy + 8), 1)
             pygame.draw.circle(self.window_surface, (70, 90, 140), (hx, hy), 2)
@@ -1154,10 +2023,12 @@ class DesignerApp:
             if not parent:
                 continue
             pose = parent.pose.compose(motor.mount_pose)
-            start = world_to_screen((pose.x, pose.y), self.viewport_rect, self.scale, self.offset)
+            start = world_to_screen((pose.x, pose.y), self.viewport_rect, self.scale, self.offset, self.view_rotation)
             length = 0.08
             dir_vec = (math.cos(pose.theta), math.sin(pose.theta))
-            end = world_to_screen((pose.x + dir_vec[0] * length, pose.y + dir_vec[1] * length), self.viewport_rect, self.scale, self.offset)
+            end = world_to_screen(
+                (pose.x + dir_vec[0] * length, pose.y + dir_vec[1] * length), self.viewport_rect, self.scale, self.offset, self.view_rotation
+            )
             active = self.selected_device == ("actuator", motor.name)
             hovered = self.hover_device == ("actuator", motor.name)
             color = (0, 200, 150)
@@ -1173,7 +2044,7 @@ class DesignerApp:
             if not parent:
                 continue
             spose = parent.pose.compose(sensor.mount_pose)
-            base = world_to_screen((spose.x, spose.y), self.viewport_rect, self.scale, self.offset)
+            base = world_to_screen((spose.x, spose.y), self.viewport_rect, self.scale, self.offset, self.view_rotation)
             active = self.selected_device == ("sensor", sensor.name)
             hovered = self.hover_device == ("sensor", sensor.name)
             color = (220, 200, 120)
@@ -1185,40 +2056,46 @@ class DesignerApp:
             tag = getattr(sensor, "visual_tag", "")
             rng = 0.2 if tag in ("sensor.distance",) else 0.12
             dir_vec = (math.cos(spose.theta), math.sin(spose.theta))
-            end = world_to_screen((spose.x + dir_vec[0] * rng, spose.y + dir_vec[1] * rng), self.viewport_rect, self.scale, self.offset)
+            end = world_to_screen(
+                (spose.x + dir_vec[0] * rng, spose.y + dir_vec[1] * rng), self.viewport_rect, self.scale, self.offset, self.view_rotation
+            )
             pygame.draw.line(self.window_surface, color, base, end, 2)
             # simple frustum fan for distance sensors
             if tag in ("sensor.distance",):
                 left_dir = pygame.math.Vector2(dir_vec).rotate(12)
                 right_dir = pygame.math.Vector2(dir_vec).rotate(-12)
-                left_end = world_to_screen((spose.x + left_dir.x * rng, spose.y + left_dir.y * rng), self.viewport_rect, self.scale, self.offset)
-                right_end = world_to_screen((spose.x + right_dir.x * rng, spose.y + right_dir.y * rng), self.viewport_rect, self.scale, self.offset)
+                left_end = world_to_screen(
+                    (spose.x + left_dir.x * rng, spose.y + left_dir.y * rng), self.viewport_rect, self.scale, self.offset, self.view_rotation
+                )
+                right_end = world_to_screen(
+                    (spose.x + right_dir.x * rng, spose.y + right_dir.y * rng), self.viewport_rect, self.scale, self.offset, self.view_rotation
+                )
                 pygame.draw.line(self.window_surface, color, base, left_end, 1)
                 pygame.draw.line(self.window_surface, color, base, right_end, 1)
         # ghost preview for device placement
         if self.mode == "add_device" and self.hover_world:
-            pos = world_to_screen(self.hover_world, self.viewport_rect, self.scale, self.offset)
+            pos = world_to_screen(self.hover_world, self.viewport_rect, self.scale, self.offset, self.view_rotation)
             pygame.draw.circle(self.window_surface, (120, 160, 200), pos, 6, 2)
             pygame.draw.line(self.window_surface, (120, 160, 200), (pos[0], pos[1] - 10), (pos[0], pos[1] + 10), 1)
             pygame.draw.line(self.window_surface, (120, 160, 200), (pos[0] - 10, pos[1]), (pos[0] + 10, pos[1]), 1)
 
     def _draw_grid(self) -> None:
         spacing = 0.1
-        top_left_world = screen_to_world(self.viewport_rect.topleft, self.viewport_rect, self.scale, self.offset)
-        bottom_right_world = screen_to_world(self.viewport_rect.bottomright, self.viewport_rect, self.scale, self.offset)
+        top_left_world = screen_to_world(self.viewport_rect.topleft, self.viewport_rect, self.scale, self.offset, self.view_rotation)
+        bottom_right_world = screen_to_world(self.viewport_rect.bottomright, self.viewport_rect, self.scale, self.offset, self.view_rotation)
         min_x = int(min(top_left_world[0], bottom_right_world[0]) / spacing) - 1
         max_x = int(max(top_left_world[0], bottom_right_world[0]) / spacing) + 1
         min_y = int(min(top_left_world[1], bottom_right_world[1]) / spacing) - 1
         max_y = int(max(top_left_world[1], bottom_right_world[1]) / spacing) + 1
         for ix in range(min_x, max_x + 1):
             x_world = ix * spacing
-            p1 = world_to_screen((x_world, min_y * spacing), self.viewport_rect, self.scale, self.offset)
-            p2 = world_to_screen((x_world, max_y * spacing), self.viewport_rect, self.scale, self.offset)
+            p1 = world_to_screen((x_world, min_y * spacing), self.viewport_rect, self.scale, self.offset, self.view_rotation)
+            p2 = world_to_screen((x_world, max_y * spacing), self.viewport_rect, self.scale, self.offset, self.view_rotation)
             pygame.draw.line(self.window_surface, (36, 36, 42), p1, p2, 1)
         for iy in range(min_y, max_y + 1):
             y_world = iy * spacing
-            p1 = world_to_screen((min_x * spacing, y_world), self.viewport_rect, self.scale, self.offset)
-            p2 = world_to_screen((max_x * spacing, y_world), self.viewport_rect, self.scale, self.offset)
+            p1 = world_to_screen((min_x * spacing, y_world), self.viewport_rect, self.scale, self.offset, self.view_rotation)
+            p2 = world_to_screen((max_x * spacing, y_world), self.viewport_rect, self.scale, self.offset, self.view_rotation)
             pygame.draw.line(self.window_surface, (36, 36, 42), p1, p2, 1)
 
     def _undo(self) -> None:

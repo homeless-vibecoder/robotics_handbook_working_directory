@@ -83,8 +83,8 @@ This document explains how the simulation stack works, from a high-level view do
 - Each sensor stores last reading and metadata (timestamp, preset).
 
 ### 3.6 Motors
-- `WheelMotor`: applies force along heading at mount point; force = command * max_force.
-- `WheelMotorDetailed`: torque → angular speed with inertia, traction clamp, gear ratio; converts to force at wheel contact direction.
+- `WheelMotor`: tracks a preferred tangential speed (command → wheel omega → tangential speed) and applies impulses to drive the contact point toward that speed; impulses are clamped by motor authority and traction.
+- `WheelMotorDetailed`: torque → angular speed with inertia and gear ratio; uses the same traction-aware tangential-speed solver, with reaction torque fed back into the motor.
 - Wheel traction (top-down uses virtual load): normal load `N = normal_force` or `mass * g_equiv / wheel_count` (defaults g_equiv=9.81, wheel_count=2). Longitudinal impulses clamp to `mu_long * N`, lateral slip constrained with `mu_lat * N` and damping (`lateral_damping`) to avoid oscillation. Configure via actuator params or wheel presets (mu_long, mu_lat, g_equiv/normal_force, lateral_damping, wheel_count, wheel_radius, max_force/preset).
 - Auto wheel-count: if `wheel_count` is omitted, the simulator counts wheel motors on the same body and splits the virtual normal load equally. Override by setting `wheel_count` or `normal_force`.
 - `DifferentialDrive`: two wheels with base separation; commands left/right.
