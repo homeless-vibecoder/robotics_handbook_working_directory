@@ -121,6 +121,13 @@ class DesignerApp:
 
         # UI helpers
         self.custom_message = ""
+        self.workspace_dialog: Optional[pygame_gui.elements.UIWindow] = None
+        self.workspace_type_dropdown: Optional[pygame_gui.elements.UIDropDownMenu] = None
+        self.workspace_action_dropdown: Optional[pygame_gui.elements.UIDropDownMenu] = None
+        self.workspace_name_entry: Optional[pygame_gui.elements.UITextEntryLine] = None
+        self.workspace_file_dialog: Optional[UIFileDialog] = None
+        self.workspace_file_mode: Optional[str] = None
+        self.workspace_file_type: Optional[str] = None
 
         self._build_ui()
         self._init_hover_menu()
@@ -268,6 +275,12 @@ class DesignerApp:
 
     def _init_hover_menu(self) -> None:
         font = pygame.font.Font(pygame.font.get_default_font(), 14)
+        workspace_children = lambda k: [
+            {"label": "New", "action": lambda kk=k: self._workspace_action("new", kk)},
+            {"label": "Open", "action": lambda kk=k: self._workspace_action("open", kk)},
+            {"label": "Save", "action": lambda kk=k: self._workspace_action("save", kk)},
+            {"label": "Save As", "action": lambda kk=k: self._workspace_action("save_as", kk)},
+        ]
         self.hover_menu = HoverMenu(
             [
                 (
@@ -280,7 +293,16 @@ class DesignerApp:
                             "checked": lambda: self.grid_enabled,
                         },
                     ],
-                )
+                ),
+                (
+                    "Workspace",
+                    [
+                        {"label": "Robot", "children": workspace_children("robot")},
+                        {"label": "Environment", "children": workspace_children("environment")},
+                        {"label": "Custom", "children": workspace_children("custom")},
+                        {"label": "Scenario", "children": workspace_children("scenario")},
+                    ],
+                ),
             ],
             pos=(20, 8),
             font=font,
@@ -294,7 +316,7 @@ class DesignerApp:
         self._dirty_flag("robot", False)
         self._dirty_flag("environment", False)
         self._dirty_flag("custom", False)
-        self.status_hint = "Blank workspace: open or create a robot/env/custom, or load a scenario when ready."
+        self.status_hint = "Blank workspace: use Workspace menu to create/open robot/env/custom/scenario."
 
     # Menu helpers for hover menus
     def _select_scenario_menu(self, name: str) -> None:
@@ -348,6 +370,46 @@ class DesignerApp:
         self.shape_tool = tool
         self.status_hint = f"Shape tool: {tool}"
         self._refresh_hover_menu()
+
+    def _update_status_context(self) -> None:
+        self.status_text = (
+            f"Active: {self.active_tab} • Robot: {self.robot_design_name or '<none>'} • "
+            f"Env: {self.env_design_name or '<none>'} • Custom: {self.custom_design_name or '<none>'}"
+        )
+
+    def _workspace_action(self, action: str, kind: str) -> None:
+        if kind not in ("robot", "environment", "custom", "scenario"):
+            return
+        # Align tab/context to the chosen kind (scenario keeps current tab)
+        if kind in ("robot", "environment", "custom"):
+            self._apply_tab_switch(kind)
+        if action == "new":
+            if kind == "scenario":
+                self.scenario_name = "untitled_scenario"
+                self._save_scenario()
+                self.status_hint = "New scenario stub saved to scenarios/untitled_scenario"
+            else:
+                self._new_design(kind)
+        elif action == "open":
+            if kind == "scenario":
+                if self.scenario_names:
+                    self._select_scenario_menu(self.scenario_names[0])
+                    self.status_hint = f"Opened scenario {self.scenario_name}"
+                else:
+                    self.status_hint = "No scenarios found to open"
+            else:
+                self._open_design(kind)
+        elif action == "save":
+            if kind == "scenario":
+                self._save_scenario()
+            else:
+                self._save_design(kind)
+        elif action == "save_as":
+            if kind == "scenario":
+                self._save_scenario_as()
+            else:
+                self._save_design(kind, save_as=True)
+        self._update_status_context()
 
     def _update_brush_label(self) -> None:
         if self.brush_label:
@@ -457,30 +519,43 @@ class DesignerApp:
                     ],
                 ),
                 (
-                    "Robot design",
+                    "Workspace",
                     [
-                        {"label": "New", "action": lambda: self._new_design("robot")},
-                        {"label": "Open", "action": lambda: self._open_design("robot")},
-                        {"label": "Save", "action": lambda: self._save_design("robot")},
-                        {"label": "Save As", "action": lambda: self._save_design("robot", save_as=True)},
-                    ],
-                ),
-                (
-                    "Environment design",
-                    [
-                        {"label": "New", "action": lambda: self._new_design("environment")},
-                        {"label": "Open", "action": lambda: self._open_design("environment")},
-                        {"label": "Save", "action": lambda: self._save_design("environment")},
-                        {"label": "Save As", "action": lambda: self._save_design("environment", save_as=True)},
-                    ],
-                ),
-                (
-                    "Custom asset",
-                    [
-                        {"label": "New", "action": lambda: self._new_design("custom")},
-                        {"label": "Open", "action": lambda: self._open_design("custom")},
-                        {"label": "Save", "action": lambda: self._save_design("custom")},
-                        {"label": "Save As", "action": lambda: self._save_design("custom", save_as=True)},
+                        {
+                            "label": "Robot",
+                            "children": [
+                                {"label": "New", "action": lambda: self._workspace_action("new", "robot")},
+                                {"label": "Open", "action": lambda: self._workspace_action("open", "robot")},
+                                {"label": "Save", "action": lambda: self._workspace_action("save", "robot")},
+                                {"label": "Save As", "action": lambda: self._workspace_action("save_as", "robot")},
+                            ],
+                        },
+                        {
+                            "label": "Environment",
+                            "children": [
+                                {"label": "New", "action": lambda: self._workspace_action("new", "environment")},
+                                {"label": "Open", "action": lambda: self._workspace_action("open", "environment")},
+                                {"label": "Save", "action": lambda: self._workspace_action("save", "environment")},
+                                {"label": "Save As", "action": lambda: self._workspace_action("save_as", "environment")},
+                            ],
+                        },
+                        {
+                            "label": "Custom",
+                            "children": [
+                                {"label": "New", "action": lambda: self._workspace_action("new", "custom")},
+                                {"label": "Open", "action": lambda: self._workspace_action("open", "custom")},
+                                {"label": "Save", "action": lambda: self._workspace_action("save", "custom")},
+                                {"label": "Save As", "action": lambda: self._workspace_action("save_as", "custom")},
+                            ],
+                        },
+                        {
+                            "label": "Scenario",
+                            "children": [
+                                {"label": "Open", "action": lambda: self._workspace_action("open", "scenario")},
+                                {"label": "Save", "action": lambda: self._workspace_action("save", "scenario")},
+                                {"label": "Save As", "action": lambda: self._workspace_action("save_as", "scenario")},
+                            ],
+                        },
                     ],
                 ),
                 (
@@ -555,11 +630,15 @@ class DesignerApp:
         self._update_mode_buttons()
         self._refresh_hover_menu()
         self.status_hint = f"Switched to {tab} tab"
+        self._update_status_context()
+        if tab == "robot":
+            self._refresh_body_dropdown()
 
     def _new_design(self, kind: str) -> None:
         if kind == "robot":
             self.robot_cfg = RobotConfig()
             self.body_name = None
+            self._ensure_robot_defaults()
             self._after_state_change()
             self.robot_design_name = "untitled_robot"
             self._dirty_flag("robot", True)
@@ -571,8 +650,10 @@ class DesignerApp:
             self._dirty_flag("environment", True)
         else:
             self.custom_active = None
+            self._ensure_custom_defaults()
             self.custom_design_name = "untitled_custom"
             self._dirty_flag("custom", True)
+        self._update_status_context()
         self.status_hint = f"New {kind} design"
 
     def _open_design(self, kind: str) -> None:
@@ -588,6 +669,7 @@ class DesignerApp:
         try:
             if kind == "robot":
                 self.robot_cfg = load_robot_design(path)
+                self._ensure_robot_defaults()
                 self._after_state_change()
                 self.robot_design_name = path.stem
                 self._dirty_flag("robot", False)
@@ -599,11 +681,14 @@ class DesignerApp:
                 self._dirty_flag("environment", False)
             else:
                 self.custom_active = load_custom_asset(path)
+                self._ensure_custom_defaults()
                 self.custom_design_name = path.stem
                 self._dirty_flag("custom", False)
             self.status_hint = f"Opened {kind} design {path.stem}"
         except Exception as exc:
             self.status_hint = f"Failed to open {kind}: {exc}"
+        self._update_status_context()
+        self._update_status_context()
 
     def _save_design(self, kind: str, save_as: bool = False) -> None:
         root = self._design_root(kind)
@@ -631,6 +716,20 @@ class DesignerApp:
             self.status_hint = f"Saved {kind} design to {path.name}"
         except Exception as exc:
             self.status_hint = f"Failed to save {kind}: {exc}"
+        self._update_status_context()
+
+    def _save_scenario_as(self) -> None:
+        if not (self.world_cfg and self.robot_cfg):
+            self.status_hint = "Nothing to save; load or create a scenario first."
+            return
+        if not self.scenario_name:
+            self.scenario_name = "untitled_scenario"
+        target = self.scenario_root / f"{self.scenario_name}_copy"
+        target.mkdir(parents=True, exist_ok=True)
+        save_scenario(target, self.world_cfg, self.robot_cfg)
+        self.scenario_name = target.name
+        self.status_hint = f"Saved scenario as {self.scenario_name}"
+        self._update_status_context()
 
     def _export_scenario(self) -> None:
         if not self.scenario_name:
@@ -660,6 +759,37 @@ class DesignerApp:
         if not self.custom_active and self.world_cfg.custom_objects:
             self.custom_active = self.world_cfg.custom_objects[0]
 
+    def _ensure_robot_defaults(self) -> None:
+        if not self.robot_cfg:
+            self.robot_cfg = RobotConfig()
+        if not getattr(self.robot_cfg, "bodies", None):
+            self.robot_cfg.bodies = [
+                BodyConfig(
+                    name="body",
+                    points=[(0.1, -0.06), (0.1, 0.06), (-0.08, 0.06), (-0.08, -0.06)],
+                    edges=[(0, 1), (1, 2), (2, 3), (3, 0)],
+                    pose=(0.0, 0.0, 0.0),
+                    can_move=True,
+                )
+            ]
+        if not getattr(self.robot_cfg, "spawn_pose", None):
+            self.robot_cfg.spawn_pose = (0.0, 0.0, 0.0)
+        if not self.body_name and self.robot_cfg.bodies:
+            self.body_name = self.robot_cfg.bodies[0].name
+
+    def _ensure_custom_defaults(self) -> None:
+        if not self.custom_active:
+            body = BodyConfig(
+                name="custom_body",
+                points=[(0.05, -0.05), (0.05, 0.05), (-0.05, 0.05), (-0.05, -0.05)],
+                edges=[(0, 1), (1, 2), (2, 3), (3, 0)],
+                pose=(0.0, 0.0, 0.0),
+                can_move=False,
+                mass=0.1,
+                inertia=0.01,
+            )
+            self.custom_active = CustomObjectConfig(name="custom_asset", body=body, kind="custom", metadata={})
+
     def _w2s(self, point: Tuple[float, float]) -> Tuple[int, int]:
         return world_to_screen(point, self.viewport_rect, self.scale, self.offset, self.view_rotation)
 
@@ -672,6 +802,7 @@ class DesignerApp:
         scenario_path = self.scenario_root / self.scenario_name
         self.world_cfg, self.robot_cfg = load_scenario(scenario_path)
         self._ensure_world_defaults()
+        self._ensure_robot_defaults()
         ds = getattr(self.world_cfg, "designer_state", DesignerState())
         self.creation_context = getattr(ds, "creation_context", "robot") or "robot"
         self.mode = getattr(ds, "mode", "select") or "select"
@@ -689,6 +820,7 @@ class DesignerApp:
         self._populate_inspector_from_selection()
         self._update_mode_buttons()
         self._refresh_hover_menu()
+        self._update_status_context()
 
     def _refresh_body_dropdown(self) -> None:
         options = [b.name for b in self.robot_cfg.bodies] if self.robot_cfg else []
@@ -1390,6 +1522,7 @@ class DesignerApp:
         )
         save_scenario(self.scenario_root / self.scenario_name, self.world_cfg, self.robot_cfg)
         print(f"Saved scenario {self.scenario_name}")
+        self._update_status_context()
 
     # --- Environment drawing/bounds -------------------------------------
     def _set_env_tool(self, tool: str) -> None:
@@ -1633,6 +1766,7 @@ class DesignerApp:
         self.status_hint = f"Bounds set ({min_x:.2f},{min_y:.2f})–({max_x:.2f},{max_y:.2f})"
 
     def _current_body_cfg(self) -> Optional[BodyConfig]:
+        self._ensure_robot_defaults()
         if not self.robot_cfg:
             return None
         if not self.body_name and self.robot_cfg.bodies:
@@ -1655,6 +1789,7 @@ class DesignerApp:
     def _handle_canvas_click(self, pos: Tuple[int, int], start_drag: bool = False) -> None:
         body_cfg = self._current_body_cfg()
         if not body_cfg and self.env_tool == "off" and not self.bounds_mode and self.mode != "draw_shape":
+            self.status_hint = "No robot body selected. Add or select a body to edit."
             return
         mods = pygame.key.get_mods()
         shift = bool(mods & pygame.KMOD_SHIFT)
@@ -1679,6 +1814,9 @@ class DesignerApp:
             dtype = self.pending_device_type or self.device_dropdown.selected_option or "motor"
             if dtype:
                 self._push_undo_state()
+                if not body_cfg:
+                    self.status_hint = "Add a body before placing devices."
+                    return
                 placed = self._create_device_at_point(body_cfg, world_point, str(dtype))
                 self._after_state_change()
                 if placed:
@@ -1716,6 +1854,8 @@ class DesignerApp:
                 self.status_hint = "Drag to reposition device; edit pose in inspector."
                 self._populate_inspector_from_selection()
                 return
+        if not body_cfg:
+            return
         body_pose = self._body_pose(body_cfg)
         local_point = body_pose.inverse().transform_point(world_point)
         if self.mode == "add":

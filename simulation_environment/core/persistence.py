@@ -55,11 +55,13 @@ def load_scenario(path: Path) -> Tuple[WorldConfig, RobotConfig]:
         robot_path = _resolve_asset(path, robot_ref)
         world_cfg = load_environment_design(env_path)
         robot_cfg = load_robot_design(robot_path)
+        _normalize_robot(robot_cfg)
         return world_cfg, robot_cfg
 
     # legacy pair in-place
     world_cfg = load_json(path / "world.json", WorldConfig)
     robot_cfg = load_json(path / "robot.json", RobotConfig)
+    _normalize_robot(robot_cfg)
     return world_cfg, robot_cfg
 
 
@@ -192,6 +194,17 @@ def _normalize_world(world_cfg: WorldConfig) -> None:
 
 def _normalize_robot(robot_cfg: RobotConfig) -> None:
     """Keep device ordering stable for deterministic saves."""
+    # Ensure at least one body exists to avoid downstream None crashes.
+    if not getattr(robot_cfg, "bodies", None):
+        robot_cfg.bodies = [
+            BodyConfig(
+                name="body",
+                points=[(0.1, -0.06), (0.1, 0.06), (-0.08, 0.06), (-0.08, -0.06)],
+                edges=[(0, 1), (1, 2), (2, 3), (3, 0)],
+                pose=(0.0, 0.0, 0.0),
+                can_move=True,
+            )
+        ]
     robot_cfg.actuators = sorted(robot_cfg.actuators, key=lambda a: a.name)
     robot_cfg.sensors = sorted(robot_cfg.sensors, key=lambda s: s.name)
     robot_cfg.bodies = sorted(robot_cfg.bodies, key=lambda b: b.name)
@@ -205,7 +218,9 @@ def save_robot_design(path: Path, robot_cfg: RobotConfig) -> None:
 
 
 def load_robot_design(path: Path) -> RobotConfig:
-    return load_json(path, RobotConfig)
+    robot = load_json(path, RobotConfig)
+    _normalize_robot(robot)
+    return robot
 
 
 def save_environment_design(path: Path, world_cfg: WorldConfig) -> None:

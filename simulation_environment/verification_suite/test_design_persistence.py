@@ -33,7 +33,16 @@ def test_robot_design_roundtrip(tmp_path: Path) -> None:
     loaded = load_robot_design(path)
     assert len(loaded.bodies) == 1
     assert loaded.bodies[0].name == "base"
-    assert loaded.bodies[0].points == robot.bodies[0].points
+    assert [tuple(p) for p in loaded.bodies[0].points] == [tuple(p) for p in robot.bodies[0].points]
+
+
+def test_robot_design_inserts_default_body_when_empty(tmp_path: Path) -> None:
+    robot = RobotConfig()
+    path = _tmp(tmp_path, "robot_empty")
+    save_robot_design(path, robot)
+    loaded = load_robot_design(path)
+    assert len(loaded.bodies) >= 1
+    assert loaded.bodies[0].points, "default body should define geometry"
 
 
 def test_environment_design_roundtrip(tmp_path: Path) -> None:
@@ -57,5 +66,5 @@ def test_custom_asset_roundtrip(tmp_path: Path) -> None:
     save_custom_asset(path, asset)
     loaded = load_custom_asset(path)
     assert loaded.name == "custom_asset"
-    assert loaded.body.points == body.points
+    assert [tuple(p) for p in loaded.body.points] == [tuple(p) for p in body.points]
     assert loaded.metadata.get("tag") == "test"

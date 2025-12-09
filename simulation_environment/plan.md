@@ -244,3 +244,5 @@ Things need more explanations. e.g. what even is logging - the terms aren't triv
 It would also be nice, if there were a more "supportive view" or analysis of the code - to visualize what the current code does. Not entirely sure if this is a good idea though.
 
 ## 
+In Runner, can we click on the motors and stuff to see their status/behavior?
+Add the plotter and etc as a window - be able to select the .csv log and be able to open the plotting/analysis window.
